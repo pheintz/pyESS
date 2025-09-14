@@ -1,0 +1,40 @@
+{
+  "6 axis 18 button gamepad with hat switch": {
+    "mapping": {
+      "BUTTONS": {
+        "0": "A",
+        "1": "B",
+        "6": "LB",
+        "7": "RB",
+        "12": "START",
+        "17": "BACK"
+      },
+      "C_BUTTON_INDICES": {},
+      "C_AXIS_INDICES": {
+        "UP": {
+          "axis": 4,
+          "sign": -1
+        },
+        "DOWN": {
+          "axis": 4,
+          "sign": 1
+        },
+        "LEFT": {
+          "axis": 3,
+          "sign": -1
+        },
+        "RIGHT": {
+          "axis": 3,
+          "sign": 1
+        }
+      },
+      "TRIGGERS": {
+        "type": "buttons",
+        "lt": 8,
+        "rt": null
+      },
+      "DPAD_AS_BUTTONS": {}
+    },
+    "has_hat": true
+  }
+}

@@ -1,528 +1,470 @@
-﻿"""
-winpad_remap.py — Windows controller → (virtual) Xbox 360 controller remapper
-STRICT mode (close to ESS-Adapter behavior) + Headless + Live Web UI
---------------------------------------------------------------------
-- Reads a physical Windows gamepad (pygame), outputs to a virtual Xbox 360 pad (vgamepad / ViGEmBus).
-- Optional N64 octagon mapping via pyESS_test.GCN64Map (if provided next to this file).
-- Optional VC inverse via pyESS_test.VCInverseMap/VCInverse (if provided).
-- Headless loop (no window), local web UI for live edits (repo-aligned toggles only).
-
-Setup
-1) Install ViGEmBus from https://vigembus.org/ (required for vgamepad)
-2) pip install pygame vgamepad Flask Werkzeug numpy
-3) Place pyESS_test.py next to this file for N64/VC mappings (optional).
-4) Run: python winpad_remap.py  → then open http://127.0.0.1:8765
-
-Notes
-- STRICT_MODE=True: disables custom "ESS zone shaping" and sets smoothing=0.0 to stay faithful to ESS-Adapter.
-- Exposed controls in UI: ESS mapping on/off, mapper mode, VC inverse, Trigger Fix + threshold.
-"""
-
-# ---------- Imports ----------
-import math
-import time
-import sys
-import os
-import json
-import traceback
-import threading
-from dataclasses import dataclass
-from typing import Tuple, Optional
-
+﻿# pyESS_profiles.py — console, profile at startup, with C-axis fallback + diagnostics
+#
+# Key features:
+# - Quick Mapping Wizard (press A/B/L/R/Z/START and C-UP/DOWN/LEFT/RIGHT).
+# - Supports C mapped as BUTTONS or as AXES (digital deflections).
+# - **Fallback** for 8BitDo/SDL pads: if C mapping is missing, assumes C on axes 4/5 (±).
+# - --diag prints raw Buttons/Axes/Hats at a steady rate to verify inputs.
+#
+# Common commands:
+#   python pyESS_profiles.py --device 1 --learn     # run wizard on device 1
+#   python pyESS_profiles.py --device 1 -p 2        # use learned mapping, profile 2
+#   python pyESS_profiles.py --device 1 --diag      # show raw input stream
+#
+import math, sys, argparse, json, os, time
 import pygame
-from vgamepad import VX360Gamepad, XUSB_BUTTON
-from flask import Flask, request, jsonify
-from werkzeug.serving import make_server
-
-# Follow ESS-Adapter behavior as closely as possible
-STRICT_MODE = True
-
-# ---------- Optional mapping imports from your local file ----------
-HAVE_GCN64 = False
-HAVE_VCINV = False
-VCInverse = None
 try:
-    from pyESS_test import GCN64Map  # N64 octagon mapper (your file)
-    HAVE_GCN64 = True
+    import vgamepad as vg
 except Exception:
-    pass
+    print("vgamepad is required at runtime. Install via: pip install vgamepad")
+    raise
 
-try:
-    # Try two common names the user might have
-    from pyESS_test import VCInverseMap as VCInverse  # class with .map(x,y)
-    HAVE_VCINV = True
-except Exception:
+MAP_FILE = os.path.join(os.path.dirname(__file__), "pyESS_device_mappings.json")
+
+# ----------------- CORE / ESS CONFIG -----------------
+DEVICE_INDEX = 0
+HZ = 250
+DEADZONE_RADIUS   = 0.1
+ESS_INPUT_START   = 0.1
+ESS_INPUT_END     = 0.5
+ESS_OUTPUT_START  = 0.1
+ESS_OUTPUT_END    = 0.25
+OCTAGON_DIAGONAL = 0.9
+
+SHOW_CURRENT_PRESSED_LINE = True
+LOG_BUTTON_TRANSITIONS    = True
+TRIGGER_THRESHOLD         = 140
+C_AXIS_THRESHOLD          = 0.6
+C_AXIS_HYSTERESIS         = 0.45
+
+# ----------------- XUSB CONSTANT SHORTCUTS -----------------
+def XUSB(alias: str):
+    return {
+        'A': vg.XUSB_BUTTON.XUSB_GAMEPAD_A,
+        'B': vg.XUSB_BUTTON.XUSB_GAMEPAD_B,
+        'X': vg.XUSB_BUTTON.XUSB_GAMEPAD_X,
+        'Y': vg.XUSB_BUTTON.XUSB_GAMEPAD_Y,
+        'LB': vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER,
+        'RB': vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER,
+        'BACK': vg.XUSB_BUTTON.XUSB_GAMEPAD_BACK,
+        'START': vg.XUSB_BUTTON.XUSB_GAMEPAD_START,
+        'L3': vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB,
+        'R3': vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_THUMB,
+        'DPAD_UP': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP,
+        'DPAD_DOWN': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN,
+        'DPAD_LEFT': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT,
+        'DPAD_RIGHT': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT,
+    }[alias]
+
+# ----------------- SAFE HELPERS -----------------
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def scale_axis_to_i16(v): return int(clamp(v, -1.0, 1.0) * 32767)
+def axis_safe(js, idx, default=0.0):
     try:
-        from pyESS_test import VCInverse as VCInverse
-        HAVE_VCINV = True
+        if idx is None: return default
+        return js.get_axis(idx)
+    except Exception:
+        return default
+def btn_safe(js, idx):
+    try:
+        if idx is None: return False
+        n = js.get_numbuttons()
+        if idx < 0 or idx >= n: return False
+        return bool(js.get_button(idx))
+    except Exception:
+        return False
+def get_axis(js, pconf, name):
+    idx = pconf['AXES'].get(name)
+    v = axis_safe(js, idx, 0.0)
+    if pconf['INVERT'].get(name, False): v = -v
+    return v
+
+# ----------------- ESS + OCTAGON -----------------
+def remap_stick(x, y):
+    raw_radius = math.hypot(x, y)
+    if raw_radius < DEADZONE_RADIUS: return 0.0, 0.0
+    new_radius = raw_radius
+    if ESS_INPUT_START <= raw_radius <= ESS_INPUT_END:
+        ir = ESS_INPUT_END - ESS_INPUT_START
+        if ir > 1e-6:
+            orng = ESS_OUTPUT_END - ESS_OUTPUT_START
+            prog = (raw_radius - ESS_INPUT_START) / ir
+            new_radius = ESS_OUTPUT_START + prog * orng
+    elif raw_radius > ESS_INPUT_END:
+        ir = 1.0 - ESS_INPUT_END
+        if ir > 1e-6:
+            orng = 1.0 - ESS_OUTPUT_END
+            prog = (raw_radius - ESS_INPUT_END) / ir
+            new_radius = ESS_OUTPUT_END + prog * orng
+    scale = new_radius / raw_radius if raw_radius > 1e-6 else 0.0
+    ox, oy = x*scale, y*scale
+    L1 = abs(ox) + abs(oy); Linf = max(abs(ox), abs(oy))
+    if Linf > 0:
+        ratio = L1 / Linf; prog = ratio - 1.0
+        final_scale = 1.0 + prog * (OCTAGON_DIAGONAL - 1.0)
+        ox *= final_scale; oy *= final_scale
+    return ox, oy
+
+# ----------------- IO READERS -----------------
+def read_triggers(js, pconf):
+    t = pconf['TRIGGERS']
+    if t['type'] == 'axes':
+        lt_raw = get_axis(js, pconf, t['lt'])
+        rt_raw = get_axis(js, pconf, t['rt'])
+        lt_b = int(clamp((lt_raw + 1.0)/2.0, 0.0, 1.0)*255) if t['lt'] is not None else 0
+        rt_b = int(clamp((rt_raw + 1.0)/2.0, 0.0, 1.0)*255) if t['rt'] is not None else 0
+    else:
+        lt_b = 255 if btn_safe(js, t.get('lt')) else 0
+        rt_b = 255 if btn_safe(js, t.get('rt')) else 0
+    return lt_b, rt_b
+
+def read_dpad(js, pconf):
+    if js.get_numhats() > 0:
+        hatx, haty = js.get_hat(0)
+        return (haty>0, haty<0, hatx<0, hatx>0)
+    m = pconf.get('DPAD_AS_BUTTONS', {}) or {}
+    def idx_for(alias):
+        return next((i for i,a in m.items() if a==alias), None)
+    return (btn_safe(js, idx_for('DPAD_UP')),
+            btn_safe(js, idx_for('DPAD_DOWN')),
+            btn_safe(js, idx_for('DPAD_LEFT')),
+            btn_safe(js, idx_for('DPAD_RIGHT')))
+
+def read_buttons(js, pconf):
+    btn_states = {}
+    for idx, alias in pconf['BUTTONS'].items():
+        btn_states[XUSB(alias)] = btn_safe(js, idx)
+    return btn_states
+
+def read_c_buttons(js, pconf):
+    if pconf.get('C_AXIS_INDICES'):
+        c = {}
+        for name, desc in pconf['C_AXIS_INDICES'].items():
+            ax = desc['axis']; sign = desc['sign']
+            val = axis_safe(js, ax, 0.0)
+            if sign > 0: c[name] = val >= C_AXIS_THRESHOLD
+            else:        c[name] = val <= -C_AXIS_THRESHOLD
+        return c
+    if pconf.get('C_BUTTON_INDICES'):
+        return {k: btn_safe(js, idx) for k, idx in pconf['C_BUTTON_INDICES'].items()}
+    return {'UP': False, 'DOWN': False, 'LEFT': False, 'RIGHT': False}
+
+def apply_c_mode(c, pconf, rx, ry, dpad_tuple, btn_states):
+    mode = pconf.get('C_MODE', 'OFF')
+    if mode == 'OFF': return rx, ry, dpad_tuple, btn_states
+    if mode == 'RIGHT_STICK':
+        mag = pconf.get('C_RS_VALUE', 1.0)
+        want_x = (-mag if c.get('LEFT') else (mag if c.get('RIGHT') else 0.0))
+        want_y = (-mag if c.get('UP')   else (mag if c.get('DOWN')  else 0.0))
+        rx = want_x if abs(want_x) > abs(rx) else rx
+        ry = want_y if abs(want_y) > abs(ry) else ry
+        return rx, ry, dpad_tuple, btn_states
+    if mode == 'DPAD':
+        up,down,left,right = dpad_tuple
+        up   = up   or c.get('UP', False)
+        down = down or c.get('DOWN', False)
+        left = left or c.get('LEFT', False)
+        right= right or c.get('RIGHT', False)
+        return rx, ry, (up,down,left,right), btn_states
+    if mode == 'ABXY':
+        if c.get('UP'):    btn_states[XUSB('Y')] = True
+        if c.get('DOWN'):  btn_states[XUSB('A')] = True
+        if c.get('LEFT'):  btn_states[XUSB('X')] = True
+        if c.get('RIGHT'): btn_states[XUSB('B')] = True
+    return rx, ry, dpad_tuple, btn_states
+
+# ----------------- PROFILES (BASELINES) -----------------
+BASE_DINPUT = {
+    'AXES':   {"LX": 0, "LY": 1, "RX": None, "RY": None, "LT": None, "RT": None},
+    'INVERT': {"LY": True, "RY": True},
+    'TRIGGERS': {'type': 'buttons', 'lt': None, 'rt': None},
+    'BUTTONS': {},
+    'DPAD_AS_BUTTONS': {},
+    'C_MODE': 'RIGHT_STICK',
+    'C_BUTTON_INDICES': {},
+    'C_AXIS_INDICES': {},
+    'C_RS_VALUE': 1.0
+}
+PROFILES = {
+    'GENERIC_XINPUT': {
+        'AXES':   {"LX": 0, "LY": 1, "RX": 2, "RY": 3, "LT": 4, "RT": 5},
+        'INVERT': {"LY": True, "RY": True},
+        'TRIGGERS': {'type': 'axes', 'lt': 'LT', 'rt': 'RT'},
+        'BUTTONS': {0:'A',1:'B',2:'X',3:'Y',4:'LB',5:'RB',6:'BACK',7:'START',8:'L3',9:'R3'},
+        'DPAD_AS_BUTTONS': {},
+        'C_MODE': 'OFF',
+        'C_BUTTON_INDICES': None,
+    },
+    'N64_SWITCH_DINPUT_RS_C': {},
+    'N64_SWITCH_DINPUT_DPAD_C': {},
+}
+PROFILE_ORDER = ['GENERIC_XINPUT', 'N64_SWITCH_DINPUT_RS_C', 'N64_SWITCH_DINPUT_DPAD_C']
+
+# ----------------- MAPPING STORE -----------------
+def load_all_mappings():
+    if os.path.isfile(MAP_FILE):
+        try:
+            with open(MAP_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+def save_all_mappings(store):
+    try:
+        with open(MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+        print(f"[mapper] Saved mapping to {MAP_FILE}")
+    except Exception as e:
+        print(f"[mapper] Failed to save mapping: {e}")
+def device_key(js):
+    try: return js.get_name()
+    except Exception: return "Unknown_Device"
+
+# ----------------- QUICK MAPPING WIZARD -----------------
+def wait_for_new_button(js, already=set(), prompt="Press the button now..."):
+    print(prompt); last = set(already)
+    while True:
+        pygame.event.pump()
+        pressed = set(i for i in range(js.get_numbuttons()) if btn_safe(js, i))
+        newly = pressed - last
+        if newly:
+            idx = sorted(list(newly))[0]
+            print(f"  Detected button index: {idx}")
+            while btn_safe(js, idx): pygame.event.pump(); time.sleep(0.02)
+            return idx, pressed
+        _ = [js.get_hat(i) for i in range(js.get_numhats())]
+        time.sleep(0.01)
+
+def wait_for_c_input(js, already_buttons=set(), prompt="Press the C-button now..."):
+    print(prompt); last_btns = set(already_buttons)
+    while True:
+        pygame.event.pump()
+        btns = set(i for i in range(js.get_numbuttons()) if btn_safe(js, i))
+        newly = btns - last_btns
+        if newly:
+            idx = sorted(list(newly))[0]
+            print(f"  Detected C as BUTTON index: {idx}")
+            while btn_safe(js, idx): pygame.event.pump(); time.sleep(0.02)
+            return ('button', idx), btns
+        for ax in range(js.get_numaxes()):
+            val = js.get_axis(ax)
+            if val >= C_AXIS_THRESHOLD:
+                print(f"  Detected C as AXIS {ax} POS (+) (value={val:.2f})")
+                while js.get_axis(ax) >= C_AXIS_HYSTERESIS: pygame.event.pump(); time.sleep(0.02)
+                return ('axis', {'axis': ax, 'sign': +1}), btns
+            if val <= -C_AXIS_THRESHOLD:
+                print(f"  Detected C as AXIS {ax} NEG (-) (value={val:.2f})")
+                while js.get_axis(ax) <= -C_AXIS_HYSTERESIS: pygame.event.pump(); time.sleep(0.02)
+                return ('axis', {'axis': ax, 'sign': -1}), btns
+        _ = [js.get_hat(i) for i in range(js.get_numhats())]
+        time.sleep(0.01)
+
+def run_mapping_wizard(js):
+    print("\n=== Quick Mapping Wizard ===")
+    print("PRESS and RELEASE when prompted.\n")
+    has_hat = js.get_numhats() > 0
+    print("DPAD hat:", "yes" if has_hat else "no (we'll map as buttons)")
+
+    mapped = {
+        "BUTTONS": {},
+        "C_BUTTON_INDICES": {},
+        "C_AXIS_INDICES": {},
+        "TRIGGERS": {"type": "buttons", "lt": None, "rt": None},
+        "DPAD_AS_BUTTONS": {},
+    }
+    already = set()
+    def map_btn(label, alias):
+        nonlocal already
+        idx, already = wait_for_new_button(js, already, f"Press {label}...")
+        mapped["BUTTONS"][idx] = alias
+
+    map_btn("A", "A"); map_btn("B", "B"); map_btn("L", "LB"); map_btn("R", "RB")
+    idx_z, already = wait_for_new_button(js, already, "Press Z..."); mapped["TRIGGERS"]["lt"] = idx_z
+    idx_start, already = wait_for_new_button(js, already, "Press START..."); mapped["BUTTONS"][idx_start] = "START"
+    print("Press BACK/SELECT (or press START again to skip)...")
+    idx_maybe, already2 = wait_for_new_button(js, already, "Waiting for BACK/SELECT (or press START to skip)...")
+    if idx_maybe != idx_start:
+        mapped["BUTTONS"][idx_maybe] = "BACK"; already = already2
+        print("  (Mapped BACK)")
+    else:
+        print("  (Skipped BACK)")
+    for cname,label in [("UP","C-UP"),("DOWN","C-DOWN"),("LEFT","C-LEFT"),("RIGHT","C-RIGHT")]:
+        res, already = wait_for_c_input(js, already, f"Press {label}...")
+        if res[0]=='button': mapped["C_BUTTON_INDICES"][cname] = res[1]
+        else:                mapped["C_AXIS_INDICES"][cname]   = res[1]
+    if not has_hat:
+        for d,alias in [("UP","DPAD_UP"),("DOWN","DPAD_DOWN"),("LEFT","DPAD_LEFT"),("RIGHT","DPAD_RIGHT")]:
+            idx_d, already = wait_for_new_button(js, already, f"Press D-Pad {d}...")
+            mapped["DPAD_AS_BUTTONS"][idx_d] = alias
+    print("\nMapping complete.\n"); return mapped, has_hat
+
+def apply_mapping_to_profiles(js, mapping, has_hat):
+    # Build DINPUT profiles from BASE + mapping, with C-axis fallback if needed
+    for name, c_mode in [("N64_SWITCH_DINPUT_RS_C", "RIGHT_STICK"),
+                         ("N64_SWITCH_DINPUT_DPAD_C", "DPAD")]:
+        conf = json.loads(json.dumps(BASE_DINPUT))  # deep copy
+        conf["BUTTONS"] = mapping.get("BUTTONS", {})
+        conf["TRIGGERS"] = mapping.get("TRIGGERS", {'type':'buttons','lt':None,'rt':None})
+        conf["DPAD_AS_BUTTONS"] = {} if has_hat else mapping.get("DPAD_AS_BUTTONS", {})
+        conf["C_MODE"] = c_mode
+        c_btn = mapping.get("C_BUTTON_INDICES", {}) or {}
+        c_ax  = mapping.get("C_AXIS_INDICES", {}) or {}
+        if not c_btn and not c_ax:
+            # Fallback assume axes 4 (X) and 5 (Y) for C-stick
+            if js.get_numaxes() >= 6:
+                c_ax = {
+                    'LEFT':  {'axis': 4, 'sign': -1},
+                    'RIGHT': {'axis': 4, 'sign': +1},
+                    'UP':    {'axis': 5, 'sign': -1},
+                    'DOWN':  {'axis': 5, 'sign': +1},
+                }
+                print("[mapper] Using C-axis fallback (axes 4/5, ±).")
+            else:
+                print("[mapper] No C mapping and not enough axes for fallback.")
+        conf["C_BUTTON_INDICES"] = c_btn
+        conf["C_AXIS_INDICES"]   = c_ax
+        PROFILES[name] = conf
+
+# ----------------- STARTUP / ARGS -----------------
+def parse_args():
+    p = argparse.ArgumentParser(description="pyESS profiles — console (mapping + diagnostics)")
+    p.add_argument("-p", "--profile", help="Profile index (1..3) or name")
+    p.add_argument("--device", type=int, default=DEVICE_INDEX, help="Joystick device index (default: %(default)s)")
+    p.add_argument("--learn", action="store_true", help="Force run mapping wizard and overwrite saved mapping")
+    p.add_argument("--diag", action="store_true", help="Print raw Buttons/Axes/Hats at ~5Hz for debugging")
+    return p.parse_args()
+
+def normalize_profile_choice(choice: str):
+    if choice is None: return PROFILE_ORDER[0]
+    choice = str(choice).strip()
+    idx_map = {"1":0,"2":1,"3":2}
+    name_map = {"generic_xinput":"GENERIC_XINPUT","xinput":"GENERIC_XINPUT",
+                "rs-c":"N64_SWITCH_DINPUT_RS_C","right_stick":"N64_SWITCH_DINPUT_RS_C",
+                "dpad-c":"N64_SWITCH_DINPUT_DPAD_C","dpad":"N64_SWITCH_DINPUT_DPAD_C"}
+    if choice in idx_map: return PROFILE_ORDER[idx_map[choice]]
+    key = choice.lower()
+    if key in name_map: return name_map[key]
+    if choice in PROFILES: return choice
+    print(f"Unrecognized profile '{choice}'. Defaulting to {PROFILE_ORDER[0]}")
+    return PROFILE_ORDER[0]
+
+def print_device_summary(js):
+    print("---- Device Summary ----")
+    try:
+        print(f"Name: {js.get_name()}")
+        print(f"Axes: {js.get_numaxes()}  Buttons: {js.get_numbuttons()}  Hats: {js.get_numhats()}")
     except Exception:
         pass
+    print("------------------------")
 
-# ---------- Config ----------
-@dataclass
-class Config:
-    # Physical joystick index (0 = first detected)
-    joystick_index: int = 0
-
-    # Axis indices (typical XInput via pygame):
-    # 0=LS X, 1=LS Y, 2=RS X, 3=RS Y, 4=LT, 5=RT
-    axis_left_x: int = 0
-    axis_left_y: int = 1
-    axis_right_x: int = 2
-    axis_right_y: int = 3
-
-    # Triggers handling
-    axis_lt: Optional[int] = 4
-    axis_rt: Optional[int] = 5
-    # Some DirectInput devices expose a SINGLE combined trigger axis in [-1..1]
-    # where negative = LT, positive = RT. If you have that, set this and set axis_lt/rt=None
-    axis_combined_triggers: Optional[int] = None
-
-CFG = Config()
-
-# ---------- Runtime Settings (ESS-Adapter-aligned) ----------
-@dataclass
-class Settings:
-    mapper_mode: str = "n64_octagon" if HAVE_GCN64 else "none"  # ESS default ON if available
-    mapping_enabled: bool = True if HAVE_GCN64 else False
-    vc_inverse_enabled: bool = False  # use only if VCInverse is available
-
-    trigger_fix_enabled: bool = True
-    trigger_threshold: float = 0.35   # 0..0.95 (normalized float)
-
-    input_deadzone: float = 0.08      # applied on input floats [-1..1]
-    smoothing_alpha: float = 0.0 if STRICT_MODE else 0.25  # EMA on left stick output
-
-    # Keep fields (not used in STRICT) for compatibility with prior JSON files
-    ess_zone_inner: int = 36
-    ess_zone_outer: int = 85
-    ess_compress: float = 0.35
-    ess_shaping_enabled: bool = False if STRICT_MODE else True
-
-    # Headless: overlay disabled (no window)
-    input_display_enabled: bool = False
-
-SET = Settings()
-
-SETTINGS_FILE = "winpad_settings.json"
-LIVE_SETTINGS_FILE = "winpad_live.json"
-_live_mtime = None
-
-# Global mapper and lock so the UI thread can rebuild safely
-mapper = None
-_mapper_lock = threading.Lock()
-
-# ---------- Utilities ----------
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
-
-def faxis_to_signed127(v: float) -> int:
-    v = clamp(v, -1.0, 1.0)
-    return int(round(v * 127))
-
-def signed127_to_xinput(v: int) -> int:
-    return int(clamp(v * 256, -32768, 32767))
-
-def trigger_faxis_to_255(v: float) -> int:
-    v = clamp(v, -1.0, 1.0)
-    return int(round((v + 1.0) * 0.5 * 255))
-
-# ---------- Mappers ----------
-class BaseMapper:
-    def process(self, sx: int, sy: int) -> Tuple[int, int]:
-        return sx, sy
-
-class N64OctagonMapper(BaseMapper):
-    def __init__(self):
-        if not HAVE_GCN64:
-            raise RuntimeError("N64OctagonMapper requires pyESS_test.GCN64Map.")
-        self.gc_to_n64 = GCN64Map()
-    def process(self, sx: int, sy: int) -> Tuple[int, int]:
-        mx, my = self.gc_to_n64.map(sx, sy)
-        return int(round(mx)), int(round(my))
-
-class VCInverseMapper(BaseMapper):
-    def __init__(self):
-        if not HAVE_VCINV or VCInverse is None:
-            raise RuntimeError("VC inverse requested but not found in pyESS_test.py")
-        self._inv = VCInverse()
-    def process(self, sx: int, sy: int) -> Tuple[int, int]:
-        mx, my = self._inv.map(sx, sy) if hasattr(self._inv, "map") else self._inv(sx, sy)
-        return int(round(mx)), int(round(my))
-
-class ChainMapper(BaseMapper):
-    def __init__(self, *mappers):
-        self._chain = [m for m in mappers if m is not None]
-    def process(self, sx: int, sy: int) -> Tuple[int, int]:
-        x, y = sx, sy
-        for m in self._chain:
-            x, y = m.process(x, y)
-        return x, y
-
-# (Kept for compatibility; disabled in STRICT mode)
-def apply_ess_zones(x: int, y: int) -> Tuple[int, int]:
-    r = math.hypot(x, y)
-    if r <= 1e-6:
-        return x, y
-    inner = max(0, min(127, SET.ess_zone_inner))
-    outer = max(inner, min(127, SET.ess_zone_outer))
-    comp = max(0.0, min(1.0, SET.ess_compress))
-    if r < inner or r > outer or comp >= 0.999:
-        return x, y
-    new_r = inner + (r - inner) * comp
-    scale = new_r / r
-    return int(round(x * scale)), int(round(y * scale))
-
-# ---------- Settings load/save & live apply ----------
-def _apply_settings_dict(d: dict):
-    for k in [
-        "mapper_mode", "mapping_enabled", "vc_inverse_enabled",
-        "trigger_fix_enabled", "trigger_threshold",
-        "input_deadzone", "smoothing_alpha",
-        "ess_zone_inner", "ess_zone_outer", "ess_compress", "ess_shaping_enabled",
-    ]:
-        if k in d:
-            setattr(SET, k, d[k])
-    # clamps
-    SET.input_deadzone = float(max(0.0, min(0.5, SET.input_deadzone)))
-    SET.smoothing_alpha = float(max(0.0, min(0.95, SET.smoothing_alpha)))
-    SET.trigger_threshold = float(max(0.0, min(0.95, SET.trigger_threshold)))
-    SET.ess_zone_inner = int(max(0, min(127, SET.ess_zone_inner)))
-    SET.ess_zone_outer = int(max(SET.ess_zone_inner, min(127, SET.ess_zone_outer)))
-    SET.ess_compress = float(max(0.0, min(1.0, SET.ess_compress)))
-    if STRICT_MODE:
-        # lock down extras for closer parity with ESS-Adapter
-        SET.ess_shaping_enabled = False
-        SET.smoothing_alpha = 0.0
-
-def load_settings():
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        _apply_settings_dict(data)
-        return True
-    except Exception:
-        return False
-
-def save_settings():
-    data = {
-        "mapper_mode": SET.mapper_mode,
-        "mapping_enabled": SET.mapping_enabled,
-        "vc_inverse_enabled": getattr(SET, "vc_inverse_enabled", False),
-        "trigger_fix_enabled": SET.trigger_fix_enabled,
-        "trigger_threshold": SET.trigger_threshold,
-        "input_deadzone": SET.input_deadzone,
-        "smoothing_alpha": SET.smoothing_alpha,
-        "ess_zone_inner": SET.ess_zone_inner,
-        "ess_zone_outer": SET.ess_zone_outer,
-        "ess_compress": SET.ess_compress,
-        "ess_shaping_enabled": SET.ess_shaping_enabled,
-    }
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception:
-        return False
-
-# ---------- Web UI (Flask) ----------
-app = Flask(__name__)
-
-def _settings_dict():
-    # Only expose the repo-aligned controls
-    return {
-        "mapper_mode": SET.mapper_mode,
-        "mapping_enabled": SET.mapping_enabled,
-        "vc_inverse_enabled": getattr(SET, "vc_inverse_enabled", False),
-        "trigger_fix_enabled": SET.trigger_fix_enabled,
-        "trigger_threshold": SET.trigger_threshold,
-    }
-
-@app.get("/api/state")
-def api_get_state():
-    return jsonify(_settings_dict())
-
-@app.post("/api/state")
-def api_set_state():
-    data = request.get_json(force=True, silent=True) or {}
-    _apply_settings_dict(data)
-    global mapper
-    with _mapper_lock:
-        mapper = active_mapper()
-    return jsonify({"ok": True, "applied": _settings_dict()})
-
-def _build_index_html():
-    # UI: only mapping toggle, mode, VC inverse, trigger fix & threshold (ESS-Adapter-aligned)
-    return """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>winpad_remap — Live Controls (Strict)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
- body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:720px;margin:24px auto;padding:0 12px}
- h1{font-size:20px} section{border:1px solid #ddd;border-radius:12px;padding:14px;margin:12px 0}
- label{display:block;margin:8px 0 4px} .pill{display:inline-block;padding:6px 10px;border:1px solid #ccc;border-radius:999px;cursor:pointer;margin-right:8px}
- input[type=range]{width:100%} .fine{opacity:.8;font-size:12px} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
- .btn{padding:8px 12px;border:1px solid #444;border-radius:8px;background:#111;color:#fff;cursor:pointer}
-</style>
-<script>
-async function loadState(){
-  const r = await fetch('/api/state'); const j = await r.json();
-  for (const k in j){
-    const el = document.querySelector('[data-key=\"'+k+'\"]');
-    if(!el) continue;
-    if(el.type==='checkbox'){ el.checked = !!j[k]; }
-    else if(el.type==='radio'){ document.querySelectorAll('[data-key=\"'+k+'\"]').forEach(rb=>rb.checked = (rb.value===j[k])); }
-    else { el.value = j[k]; }
-    const out = el.parentElement.querySelector('.out'); if(out) out.textContent = el.value;
-  }
-}
-async function applyChanges(){
-  const data = {};
-  document.querySelectorAll('[data-key]').forEach(el=>{
-    let v = (el.type==='checkbox') ? el.checked : (el.type==='number' ? parseFloat(el.value) : (el.type==='range'? parseFloat(el.value) : el.value));
-    if(el.type==='radio' && !el.checked) return;
-    data[el.dataset.key] = v;
-  });
-  const r = await fetch('/api/state', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
-  if(!r.ok){ alert('Apply failed'); }
-}
-function hookup(){
-  document.querySelectorAll('input').forEach(el=>{
-    if(el.type==='range'){ el.addEventListener('input', e=>{ const out = el.parentElement.querySelector('.out'); if(out) out.textContent = el.value; }); el.addEventListener('change', applyChanges); }
-    else if(el.type==='checkbox' || el.type==='number' || el.type==='radio'){ el.addEventListener('change', applyChanges); }
-    else{ el.addEventListener('blur', applyChanges); }
-  });
-}
-window.addEventListener('DOMContentLoaded', async()=>{ await loadState(); hookup(); });
-</script>
-</head>
-<body>
-  <h1>winpad_remap — Live Controls (Strict)</h1>
-  <p class="fine">This panel mirrors the features exposed by the ESS-Adapter repo: ESS mapping, VC inverse, and Trigger Fix.</p>
-
-  <section>
-    <label class="pill"><input type="checkbox" data-key="mapping_enabled"> ESS Mapping</label>
-    <div style="margin-top:6px">
-      <label><input type="radio" name="mode" value="none" data-key="mapper_mode"> Mode: none</label>
-      <label><input type="radio" name="mode" value="n64_octagon" data-key="mapper_mode"> Mode: n64_octagon</label>
-    </div>
-    <label style="margin-top:8px" class="pill"><input type="checkbox" data-key="vc_inverse_enabled"> VC Inverse (if available)</label>
-  </section>
-
-  <section>
-    <label class="pill"><input type="checkbox" data-key="trigger_fix_enabled"> Trigger Fix Enabled</label>
-    <label>Trigger Threshold: <span class="out"></span></label>
-    <input type="range" min="0" max="0.95" step="0.01" data-key="trigger_threshold">
-  </section>
-
-  <p><button class="btn" onclick="applyChanges()">Apply</button></p>
-  <p class="fine">Open <code>http://localhost:8765</code> while your game is focused.</p>
-</body>
-</html>"""
-@app.get("/")
-def index():
-    return _build_index_html()
-
-def start_ui_server(host="127.0.0.1", port=8765):
-    server = make_server(host, port, app)
-    th = threading.Thread(target=server.serve_forever, daemon=True)
-    th.start()
-    print(f"[UI] Open http://{host}:{port}")
-    return server
-
-# ---------- Active mapper factory ----------
-def active_mapper() -> BaseMapper:
-    if SET.mapping_enabled and SET.mapper_mode == "n64_octagon" and HAVE_GCN64:
-        vc = VCInverseMapper() if (SET.vc_inverse_enabled and HAVE_VCINV) else None
-        return ChainMapper(vc, N64OctagonMapper())
-    return BaseMapper()
-
-# ---------- Main remapper ----------
+# ----------------- MAIN -----------------
 def main():
-    pygame.init()
-    pygame.joystick.init()
+    args = parse_args()
+    pygame.init(); pygame.joystick.init()
+    if pygame.joystick.get_count()==0:
+        print("No joystick found."); sys.exit(1)
+    dev_idx = args.device
+    if not (0 <= dev_idx < pygame.joystick.get_count()):
+        print(f"Device index {dev_idx} out of range (0..{pygame.joystick.get_count()-1})"); sys.exit(1)
+    js = pygame.joystick.Joystick(dev_idx); js.init()
+    print(f"Using Controller [{dev_idx}]: {js.get_name()}")
+    print_device_summary(js)
 
-    if pygame.joystick.get_count() == 0:
-        print("No joystick detected. Connect a controller and try again.", file=sys.stderr)
+    # Diagnostics stream (optional)
+    if args.diag:
+        print("Entering diagnostics stream. Ctrl+C to exit.")
+        clock = pygame.time.Clock()
+        last_buttons = last_axes = last_hats = None
+        try:
+            while True:
+                pygame.event.pump()
+                buttons = [i for i in range(js.get_numbuttons()) if btn_safe(js,i)]
+                axes = [round(axis_safe(js,i,0.0),3) for i in range(js.get_numaxes())]
+                hats = [js.get_hat(i) for i in range(js.get_numhats())]
+                if buttons != last_buttons:
+                    print("Buttons:", buttons); last_buttons = buttons
+                if axes != last_axes or hats != last_hats:
+                    print("Axes:", axes, "Hats:", hats, end="\r"); last_axes, last_hats = axes, hats
+                clock.tick(5)
+        except KeyboardInterrupt:
+            print("\nLeaving diagnostics.")
         return
 
-    js = pygame.joystick.Joystick(CFG.joystick_index)
-    js.init()
-    print(f"Using joystick #{CFG.joystick_index}: {js.get_name()}")
-    print(f"Axes: {js.get_numaxes()}, Buttons: {js.get_numbuttons()}, Hats: {js.get_numhats()}")
+    # Load or learn mapping
+    store = load_all_mappings(); key = device_key(js); dev_map = store.get(key)
+    if args.learn or not dev_map:
+        mapping, has_hat = run_mapping_wizard(js)
+        store[key] = {"mapping": mapping, "has_hat": has_hat}; save_all_mappings(store)
+        dev_map = store[key]
+    mapping = dev_map["mapping"]; has_hat = dev_map.get("has_hat", js.get_numhats()>0)
+    print("[mapper] Loaded mapping:", json.dumps(mapping, indent=2))
+    apply_mapping_to_profiles(js, mapping, has_hat)
 
-    # Start web UI for live control
+    selected = normalize_profile_choice(args.profile) if args.profile else None
+    if not selected:
+        print("Select a profile:\n  1. GENERIC_XINPUT\n  2. N64_SWITCH_DINPUT_RS_C\n  3. N64_SWITCH_DINPUT_DPAD_C")
+        raw = input("Enter 1-3 (default 2): ").strip()
+        selected = normalize_profile_choice(raw if raw else "2")
+    print(f"Starting with profile: {selected}")
+    pconf = PROFILES[selected]
+
+    gamepad = vg.VX360Gamepad(); clock = pygame.time.Clock(); last_labels = None
     try:
-        start_ui_server(host="127.0.0.1", port=8765)
-    except Exception as _e:
-        print("[UI] Failed to start web UI:", _e)
-
-    gamepad = VX360Gamepad()
-
-    global mapper
-    with _mapper_lock:
-        mapper = active_mapper()
-
-    # EMA smoothing state
-    out_lx_prev = 0
-    out_ly_prev = 0
-
-    clock = pygame.time.Clock()
-
-    while True:
-        # Keep SDL/joystick state fresh (no window)
-        pygame.event.pump()
-
-        # Live settings reload (winpad_live.json)
-        try:
-            m = os.path.getmtime(LIVE_SETTINGS_FILE)
-            global _live_mtime
-            if _live_mtime is None or m > _live_mtime:
-                _live_mtime = m
-                with open(LIVE_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                _apply_settings_dict(data)
-                with _mapper_lock:
-                    mapper = active_mapper()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            # ignore malformed file to avoid breaking gameplay; try again next tick
-            pass
-
-        # --------- READ INPUT ---------
-        def read_axis(idx: int, invert: bool = False) -> float:
-            if idx is None:
-                return 0.0
-            try:
-                v = js.get_axis(idx)
-            except Exception:
-                v = 0.0
-            if invert:
-                v = -v
-            if abs(v) < SET.input_deadzone:
-                return 0.0
-            return clamp(v, -1.0, 1.0)
-
-        # Left/Right sticks (pygame Y is up positive; XInput expects inverted Y)
-        lx = read_axis(CFG.axis_left_x)
-        ly = read_axis(CFG.axis_left_y)
-        rx = read_axis(CFG.axis_right_x)
-        ry = read_axis(CFG.axis_right_y)
-
-        # Triggers
-        lt = 0
-        rt = 0
-        if CFG.axis_combined_triggers is not None and CFG.axis_lt is None and CFG.axis_rt is None:
-            c = read_axis(CFG.axis_combined_triggers)
-            if c >= 0:
-                rt = trigger_faxis_to_255(c)
-                lt = 0
+        while True:
+            lx = get_axis(js, pconf, "LX"); ly = get_axis(js, pconf, "LY")
+            ox, oy = remap_stick(lx, ly)
+            rx = get_axis(js, pconf, "RX"); ry = get_axis(js, pconf, "RY")
+            lt_b, rt_b = read_triggers(js, pconf)
+            btn_states = read_buttons(js, pconf)
+            dpad_up, dpad_down, dpad_left, dpad_right = read_dpad(js, pconf)
+            c = read_c_buttons(js, pconf)
+            rx, ry, (dpad_up, dpad_down, dpad_left, dpad_right), btn_states = apply_c_mode(
+                c, pconf, rx, ry, (dpad_up, dpad_down, dpad_left, dpad_right), btn_states
+            )
+            labels = set()
+            for const,is_pressed in btn_states.items():
+                if is_pressed:
+                    # reverse-lookup small alias label for display
+                    for idx, alias in pconf['BUTTONS'].items():
+                        if XUSB(alias)==const: labels.add(alias); break
+            if dpad_up: labels.add('DPAD_UP')
+            if dpad_down: labels.add('DPAD_DOWN')
+            if dpad_left: labels.add('DPAD_LEFT')
+            if dpad_right: labels.add('DPAD_RIGHT')
+            if c.get('UP'): labels.add('C_UP')
+            if c.get('DOWN'): labels.add('C_DOWN')
+            if c.get('LEFT'): labels.add('C_LEFT')
+            if c.get('RIGHT'): labels.add('C_RIGHT')
+            if pconf['TRIGGERS']['type']=='buttons':
+                if btn_safe(js, pconf['TRIGGERS'].get('lt')): labels.add('LT')
+                if btn_safe(js, pconf['TRIGGERS'].get('rt')): labels.add('RT')
             else:
-                lt = trigger_faxis_to_255(-c)
-                rt = 0
-        else:
-            if CFG.axis_lt is not None:
-                lt = trigger_faxis_to_255(read_axis(CFG.axis_lt))
-            if CFG.axis_rt is not None:
-                rt = trigger_faxis_to_255(read_axis(CFG.axis_rt))
+                if lt_b>TRIGGER_THRESHOLD: labels.add('LT')
+                if rt_b>TRIGGER_THRESHOLD: labels.add('RT')
+            if labels != last_labels:
+                line = ", ".join(sorted(labels)) if labels else "(none)"
+                print(f"Pressed: {line}"); last_labels = labels
 
-        # Buttons mapping
-        def btn(i: int) -> bool:
-            try:
-                return bool(js.get_button(i))
-            except Exception:
-                return False
-
-        btn_map = {
-            0: XUSB_BUTTON.XUSB_GAMEPAD_A,
-            1: XUSB_BUTTON.XUSB_GAMEPAD_B,
-            2: XUSB_BUTTON.XUSB_GAMEPAD_X,
-            3: XUSB_BUTTON.XUSB_GAMEPAD_Y,
-            4: XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER,
-            5: XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER,
-            6: XUSB_BUTTON.XUSB_GAMEPAD_BACK,
-            7: XUSB_BUTTON.XUSB_GAMEPAD_START,
-            8: XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB,
-            9: XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_THUMB,
-        }
-
-        for idx, xusb in btn_map.items():
-            if btn(idx):
-                gamepad.press_button(button=xusb)
-            else:
-                gamepad.release_button(button=xusb)
-
-        # D-Pad via hat(0)
-        dpad_up = dpad_down = dpad_left = dpad_right = False
-        if js.get_numhats() > 0:
-            hx, hy = js.get_hat(0)
-            dpad_left  = (hx < 0)
-            dpad_right = (hx > 0)
-            dpad_up    = (hy > 0)
-            dpad_down  = (hy < 0)
-
-        gamepad.press_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)    if dpad_up    else gamepad.release_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
-        gamepad.press_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)  if dpad_down  else gamepad.release_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
-        gamepad.press_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)  if dpad_left  else gamepad.release_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
-        gamepad.press_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT) if dpad_right else gamepad.release_button(XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
-
-        # --------- MAP LEFT STICK ---------
-        sx = faxis_to_signed127(lx)
-        sy = faxis_to_signed127(ly)
-
-        with _mapper_lock:
-            local_mapper = mapper
-        if SET.mapping_enabled and local_mapper is not None:
-            mx, my = local_mapper.process(sx, sy)
-        else:
-            mx, my = sx, sy
-
-        # ESS zone shaping disabled in STRICT_MODE (kept for compatibility)
-        if (not STRICT_MODE) and getattr(SET, "ess_shaping_enabled", False):
-            mx, my = apply_ess_zones(mx, my)
-
-        # EMA smoothing and conversion to XInput (invert Y)
-        new_lx = signed127_to_xinput(mx)
-        new_ly = signed127_to_xinput(-my)
-        # With smoothing_alpha=0 in STRICT_MODE, this is effectively passthrough
-        out_lx = int(round((1.0 - SET.smoothing_alpha) * new_lx + SET.smoothing_alpha * 0))
-        out_ly = int(round((1.0 - SET.smoothing_alpha) * new_ly + SET.smoothing_alpha * 0))
-
-        # Right stick pass-through (invert Y)
-        out_rx = signed127_to_xinput(faxis_to_signed127(rx))
-        out_ry = signed127_to_xinput(-faxis_to_signed127(ry))
-
-        # Send to virtual pad
-        gamepad.left_joystick(x_value=out_lx, y_value=out_ly)
-        gamepad.right_joystick(x_value=out_rx, y_value=out_ry)
-        gamepad.left_trigger(value=lt)
-        gamepad.right_trigger(value=rt)
-
-        # Trigger Fix: analog triggers past threshold also press LB/RB
-        if SET.trigger_fix_enabled:
-            thr_255 = int(round(clamp((SET.trigger_threshold + 1.0) * 0.5 * 255, 0, 255)))
-            if lt >= thr_255:
-                gamepad.press_button(button=XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
-            if rt >= thr_255:
-                gamepad.press_button(button=XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
-
-        gamepad.update()
-
-        # Limit loop to ~250 Hz
-        clock.tick(250)
+            gamepad.left_joystick(scale_axis_to_i16(ox), scale_axis_to_i16(oy))
+            gamepad.right_joystick(scale_axis_to_i16(rx), scale_axis_to_i16(ry))
+            gamepad.left_trigger(lt_b); gamepad.right_trigger(rt_b)
+            for alias in ['A','B','X','Y','LB','RB','BACK','START','L3','R3']:
+                try: gamepad.release_button(XUSB(alias))
+                except Exception: pass
+            for const,is_pressed in btn_states.items():
+                (gamepad.press_button if is_pressed else gamepad.release_button)(const)
+            (gamepad.press_button if dpad_up    else gamepad.release_button)(XUSB('DPAD_UP'))
+            (gamepad.press_button if dpad_down  else gamepad.release_button)(XUSB('DPAD_DOWN'))
+            (gamepad.press_button if dpad_left  else gamepad.release_button)(XUSB('DPAD_LEFT'))
+            (gamepad.press_button if dpad_right else gamepad.release_button)(XUSB('DPAD_RIGHT'))
+            gamepad.update(); clock.tick(HZ)
+    except KeyboardInterrupt:
+        print("\nExiting (Ctrl+C).")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+    finally:
+        try: gamepad.reset(); gamepad.update()
+        except Exception: pass
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
-    except Exception:
-        print("\n[ERROR] The remapper crashed:\n")
-        traceback.print_exc()
-        try:
-            input("\nPress Enter to close...")
-        except Exception:
-            pass
+    main()
