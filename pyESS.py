@@ -9,17 +9,16 @@ import vgamepad as vg
 
 # ----------------- CONFIG -----------------
 # --- Core Settings ---
-DEVICE_INDEX = 0  # The index of the controller you want to use (0 is usually the first one)
+DEVICE_INDEX = 1  # The index of the controller you want to use (0 is usually the first one)
 HZ = 250          # Update frequency in Hertz. 250 is recommended for low latency.
 
-# --- Stick Response Curve ---
-DEADZONE_RADIUS = 0.1 
+DEADZONE_RADIUS = 0.08 
 
-
-ESS_INPUT_START = 0.1
-ESS_INPUT_END = 0.5
-ESS_OUTPUT_START = 0.1
-ESS_OUTPUT_END = 0.25
+DEADZONE_RADIUS  = 0.08 
+ESS_INPUT_START  = 0.14 
+ESS_INPUT_END    = 0.5
+ESS_OUTPUT_START = 0.11 # 9 / 84
+ESS_OUTPUT_END   = 0.3 # 28.5 / 84
 
 # --- N64 Shaping ---
 # How much to reshape the circular output into an N64-style octagon.
@@ -150,4 +149,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nExiting.")
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"\n error occurred: {e}")
