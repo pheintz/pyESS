@@ -1,0 +1,16 @@
+# pyESS runtime dependencies.
+# Pinned to the versions this has actually been tested against.
+pygame==2.6.1
+vgamepad==0.1.0
+
+# Python 3.11+ is required, not just recommended: the 1 kHz input loop paces itself
+# with time.sleep(), which only became high-resolution on Windows in 3.11. On older
+# builds the sleep granularity (~15 ms) would swamp the 1 ms loop period.
+# Developed and tested on Python 3.13.3 / Windows 11.
+#
+# NOT installable via pip - these are kernel drivers you must install yourself:
+#   ViGEmBus  (REQUIRED)  https://github.com/nefarius/ViGEmBus/releases
+#                         vgamepad cannot create the virtual pad without it.
+#   HidHide   (optional)  https://github.com/nefarius/HidHide/releases
+#                         Hides the physical pad so games see only the virtual one.
+#                         Without it both pads can bind at once and fight.

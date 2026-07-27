@@ -1,0 +1,42 @@
+{
+  "_README": [
+    "Stick shaping/zone config for pyESS_app.py (run pyess.bat).",
+    "",
+    "'shaping' is SHARED by both output targets - that is what keeps SoH and",
+    "Dolphin/WiiVC producing the same in-game values. Per-target settings live",
+    "under 'targets'. Everything here is editable live in the GUI.",
+    "",
+    "UNITS: all 'shaping' values are normalized [0..1].",
+    "  deadzone         square per-axis deadzone half-size; range is rescaled after it,",
+    "                   so ess_input_* are fractions of the POST-deadzone remainder.",
+    "  ess_zone_size    how much stick past the deadzone holds ESS; the window",
+    "                   always STARTS at the deadzone edge and is compressed into the\n                   derived ESS output band (see pyess_shaping.ess_output_band).",
+    "  octagon_*        gate: |x|<=cardinal, |y|<=cardinal, |x|+|y|<=2*diagonal.",
+    "                   Requires cardinal/2 < diagonal < cardinal.",
+    "",
+    "REFERENCE (decomp-verified): OoT applies its own square deadzone of 7 and clamps",
+    "raw cur at 67; magnitude <20 = ESS (pivot in place), >=20 walks. So in-game ESS is",
+    "raw cur 8..26, and cur 27 walks."
+  ],
+  "shaping": {
+    "deadzone": 0.0,
+    "ess_enable": true,
+    "octagon_cardinal": 1.0,
+    "octagon_diagonal": 0.7,
+    "ess_zone_size": 0.35
+  },
+  "targets": {
+    "soh": {
+      "_note": "pyESS_n64geo.py -> Ship of Harkinian. libultraship MAX_AXIS_RANGE=85. input_lag_ms deliberately delays output 0..100ms (SoH only; a testing/handicap aid). Reference: the MEASURED WiiVC penalty over N64 is +33.8ms (95% CI 24.8-42.8, n=43, 240fps camera) = ~2 polls at 60Hz, so 33 is the value to use if you want SoH to match Dolphin-WiiVC.",
+      "max_axis_range": 85.0,
+      "input_lag_ms": 32.62411347517731,
+      "soh_deadzone": 0.0,
+      "soh_sensitivity": 1.0
+    },
+    "dolphin": {
+      "_note": "pyESS_dolphin_vc.py -> Dolphin running the OoT WiiVC WAD. gate_compensation stays 1.0 (no-op): RESOLVED - Dolphin's Gate Size was tested and causes no problem, so no compensation is needed. Kept only as an escape hatch if a future setup cannot pass values through 1:1.",
+      "max_axis_range": 85.0,
+      "gate_compensation": 1.0
+    }
+  }
+}
