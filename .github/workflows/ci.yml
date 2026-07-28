@@ -1,0 +1,29 @@
+name: ci
+
+# Fast gate on every push/PR. Deliberately does NOT build - that takes minutes and is
+# only needed at release time. The selftest is the thing that actually catches
+# regressions: it exercises the shaping curve and the WiiVC inversion and asserts the
+# two output targets still agree, which is the property the whole project rests on.
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]        # tags are handled by release.yml
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: windows-latest    # tkinter is imported at module scope; Windows matches prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # No pip install: --selftest only needs stdlib + tkinter. pygame and vgamepad are
+      # imported lazily inside the input loop, so the gate needs no controller, no
+      # ViGEmBus and no display.
+      - name: Selftest
+        run: python pyESS_app.py --selftest
+
+      - name: Byte-compile everything
+        run: python -m compileall -q pyESS_app.py pyess_shaping.py pyess_vc.py pyess_config.py

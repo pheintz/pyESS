@@ -1,0 +1,108 @@
+name: release
+
+# Publishes a release when you push a version tag:
+#   git tag v1.0.0 && git push origin v1.0.0
+# workflow_dispatch is there so you can dry-run the build without tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # required to create the release and upload the zip
+
+jobs:
+  build:
+    # MUST be Windows: PyInstaller emits a native binary, and the whole app is
+    # Windows-only anyway (ViGEmBus is a Windows kernel driver).
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"     # 3.11+ required: the 1kHz pacer needs a
+                                     # high-resolution time.sleep on Windows
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.21.0
+
+      # Fail early and loudly if the tag and __version__ disagree - otherwise you
+      # ship v1.1.0 containing a binary that reports 1.0.0.
+      - name: Check tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v',''
+          $ver = (python pyESS_app.py --version) -replace '^pyESS ',''
+          Write-Host "tag=$tag  __version__=$ver"
+          if ($tag -ne $ver) {
+            Write-Error "Tag $tag does not match __version__ $ver - bump pyESS_app.py"
+            exit 1
+          }
+
+      # The gate. Needs no controller and no display: it exercises the shaping and
+      # the VC inversion and asserts the two targets still agree.
+      - name: Selftest
+        run: python pyESS_app.py --selftest
+
+      - name: Build
+        run: python -m PyInstaller --noconfirm --clean pyESS.spec
+
+      # These belong BESIDE the exe, not in _internal/: the GPL text has to be
+      # visible, and pyESS_zones.json must land where the frozen app looks for it.
+      - name: Stage top-level files
+        run: |
+          Copy-Item LICENSE, README.md, pyESS_zones.json dist/pyESS/
+
+      - name: Smoke-test the built exe
+        run: |
+          ./dist/pyESS/pyESS.exe --version
+          ./dist/pyESS/pyESS.exe --selftest
+
+      - name: Package
+        id: pkg
+        run: |
+          $ver = (python pyESS_app.py --version) -replace '^pyESS ',''
+          $zip = "pyESS-$ver-win64.zip"
+          Compress-Archive -Path dist/pyESS/* -DestinationPath $zip -Force
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+      # Always keep the build, even on a manual dispatch with no tag.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zip }}
+          path: ${{ steps.pkg.outputs.zip }}
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          ## Install
+
+          1. Download and extract ``${{ steps.pkg.outputs.zip }}``
+          2. **Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)** - required.
+             It is a kernel driver and cannot be bundled; without it the app cannot create
+             the virtual controller.
+          3. Optionally install [HidHide](https://github.com/nefarius/HidHide/releases) so
+             games bind only the virtual pad. Whitelist ``pyESS.exe`` **before** hiding your
+             controller, or the app loses access to it too.
+          4. Run ``pyESS.exe``
+
+          No Python installation needed.
+
+          ## Licence
+          GPLv3 - see LICENSE in the archive. Contains code from
+          [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter).
+          "@
+          $notes | Out-File -FilePath notes.md -Encoding utf8
+          gh release create "${{ github.ref_name }}" "${{ steps.pkg.outputs.zip }}" `
+            --title "pyESS ${{ steps.pkg.outputs.version }}" `
+            --notes-file notes.md `
+            --generate-notes
