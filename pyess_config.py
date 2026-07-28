@@ -37,8 +37,53 @@ TARGET_KEYS = ("max_axis_range", "gate_compensation", "input_lag_ms",
                "soh_deadzone", "soh_sensitivity")
 
 
+def _base_dir():
+    """Where pyESS_zones.json lives.
+
+    Running from source that is simply this file's directory. In a PyInstaller build
+    it must NOT be: the modules are unpacked inside the bundle (a temp _MEIxxxx dir for
+    one-file builds, which is deleted on exit), so saving there would silently discard
+    every change. Resolve next to the .exe instead, which is writable and persistent.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _config_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+    return os.path.join(_base_dir(), CONFIG_FILENAME)
+
+
+_NUMERIC = ("deadzone", "ess_zone_size", "octagon_cardinal", "octagon_diagonal",
+            "max_axis_range", "gate_compensation", "input_lag_ms",
+            "soh_deadzone", "soh_sensitivity")
+
+
+def _coerce(cfg, warn):
+    """Force numeric settings to floats before anything compares them.
+
+    pyESS_zones.json is documented as hand-editable, so a quoted number
+    ("deadzone": "0.1") or a null is entirely plausible - and used to crash the app on
+    startup with a bare TypeError from the range checks below, no GUI, no message.
+    Anything uncoercible falls back to the built-in default.
+    """
+    for key in _NUMERIC:
+        if key not in cfg:
+            continue
+        val = cfg[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            try:
+                cfg[key] = float(val)
+            except (TypeError, ValueError):
+                fallback = DEFAULT_SHAPING.get(
+                    key, DEFAULT_TARGETS.get(cfg.get("_target", ""), {}).get(key, 0.0))
+                warn(f"{key}={val!r} is not a number - using {fallback}")
+                cfg[key] = fallback
+        else:
+            cfg[key] = float(val)
+    if not isinstance(cfg.get("ess_enable", True), bool):
+        cfg["ess_enable"] = bool(cfg.get("ess_enable"))
+    return cfg
 
 
 def _validate(cfg, warn):
@@ -106,6 +151,8 @@ def load_zones(target, verbose=True):
     cfg["ess_output_start"], cfg["ess_output_end"] = ess_output_band(
         cfg.get("max_axis_range", 85.0))
 
+    cfg["_target"] = target
+    cfg = _coerce(cfg, warn)
     cfg = _validate(cfg, warn)
     cfg["_source"] = source
     cfg["_target"] = target

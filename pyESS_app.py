@@ -12,7 +12,10 @@
 #
 # Run:  python pyESS_app.py
 
+__version__ = "1.0.0"
+
 import math
+import os
 import sys
 import threading
 import time
@@ -255,6 +258,9 @@ class Engine(threading.Thread):
             self._restart.clear()
 
     def _session(self):
+        # Suppress pygame's stdout banner: noise in a console build, and with a
+        # --windowed build there is no stdout at all.
+        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
         import pygame
         import vgamepad as vg
 
@@ -453,7 +459,7 @@ class App:
         self.vars = {}
         self._known_devices = None
         self._building = True
-        root.title("pyESS - OoT stick shaper")
+        root.title(f"pyESS {__version__} - OoT stick shaper")
         root.minsize(560, 0)
 
         self._build_target(root)
@@ -924,6 +930,9 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(f"pyESS {__version__}")
+        sys.exit(0)
     if "--selftest" in sys.argv:
         sys.exit(0 if selftest() else 1)
     root = tk.Tk()
