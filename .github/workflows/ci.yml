@@ -23,7 +23,7 @@ jobs:
       # imported lazily inside the input loop, so the gate needs no controller, no
       # ViGEmBus and no display.
       - name: Selftest
-        run: python pyESS_app.py --selftest
+        run: python src/pyESS_app.py --selftest
 
       - name: Byte-compile everything
-        run: python -m compileall -q pyESS_app.py pyess_shaping.py pyess_vc.py pyess_config.py
+        run: python -m compileall -q src

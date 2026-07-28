@@ -1,4 +1,7 @@
 @echo off
-REM Launch the pyESS stick shaper GUI.
+REM ============================================
+REM   pyESS - run this file
+REM ============================================
 cd /d "%~dp0"
-python pyESS_app.py %*
+python src\pyESS_app.py %*
+if errorlevel 1 pause

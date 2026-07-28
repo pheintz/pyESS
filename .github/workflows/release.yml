@@ -37,7 +37,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           $tag = "${{ github.ref_name }}" -replace '^v',''
-          $ver = (python pyESS_app.py --version) -replace '^pyESS ',''
+          $ver = (python src/pyESS_app.py --version) -replace '^pyESS ',''
           Write-Host "tag=$tag  __version__=$ver"
           if ($tag -ne $ver) {
             Write-Error "Tag $tag does not match __version__ $ver - bump pyESS_app.py"
@@ -47,16 +47,16 @@ jobs:
       # The gate. Needs no controller and no display: it exercises the shaping and
       # the VC inversion and asserts the two targets still agree.
       - name: Selftest
-        run: python pyESS_app.py --selftest
+        run: python src/pyESS_app.py --selftest
 
       - name: Build
-        run: python -m PyInstaller --noconfirm --clean pyESS.spec
+        run: python -m PyInstaller --noconfirm --clean packaging/pyESS.spec
 
       # These belong BESIDE the exe, not in _internal/: the GPL text has to be
       # visible, and pyESS_zones.json must land where the frozen app looks for it.
       - name: Stage top-level files
         run: |
-          Copy-Item LICENSE, README.md, pyESS_zones.json dist/pyESS/
+          Copy-Item LICENSE, README.md, pyESS_zones.json, docs/pyess.ico dist/pyESS/
 
       - name: Smoke-test the built exe
         run: |
@@ -66,7 +66,7 @@ jobs:
       - name: Package
         id: pkg
         run: |
-          $ver = (python pyESS_app.py --version) -replace '^pyESS ',''
+          $ver = (python src/pyESS_app.py --version) -replace '^pyESS ',''
           $zip = "pyESS-$ver-win64.zip"
           Compress-Archive -Path dist/pyESS/* -DestinationPath $zip -Force
           "zip=$zip" >> $env:GITHUB_OUTPUT
@@ -78,7 +78,10 @@ jobs:
           name: ${{ steps.pkg.outputs.zip }}
           path: ${{ steps.pkg.outputs.zip }}
 
-      - name: Create release
+      # Idempotent on purpose. `gh release create` FAILS if the release already exists,
+      # which it will if the tag was released from the web UI first, or if this job is
+      # re-run. So: create only when missing, then upload with --clobber either way.
+      - name: Create or update release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -102,7 +105,24 @@ jobs:
           [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter).
           "@
           $notes | Out-File -FilePath notes.md -Encoding utf8
-          gh release create "${{ github.ref_name }}" "${{ steps.pkg.outputs.zip }}" `
-            --title "pyESS ${{ steps.pkg.outputs.version }}" `
-            --notes-file notes.md `
-            --generate-notes
+          $tag = "${{ github.ref_name }}"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "creating release $tag"
+            gh release create $tag `
+              --title "pyESS ${{ steps.pkg.outputs.version }}" `
+              --notes-file notes.md `
+              --generate-notes
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          } else {
+            Write-Host "release $tag already exists - updating notes"
+            gh release edit $tag `
+              --title "pyESS ${{ steps.pkg.outputs.version }}" `
+              --notes-file notes.md
+          }
+
+          # --clobber so a re-run replaces the asset instead of erroring on a duplicate
+          gh release upload $tag "${{ steps.pkg.outputs.zip }}" --clobber
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "uploaded ${{ steps.pkg.outputs.zip }}"

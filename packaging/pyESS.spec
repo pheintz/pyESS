@@ -6,7 +6,14 @@
 #   * one-file executables are a well-known antivirus false-positive magnet.
 # The result is dist/pyESS/ - zip that folder for the release.
 
+import os
+
 from PyInstaller.utils.hooks import collect_dynamic_libs
+
+# Paths in a spec resolve relative to the SPEC FILE, not the working directory, and this
+# spec lives in packaging/. Anchor everything to the project root so the build works the
+# same whether it is invoked from the root or from anywhere else.
+ROOT = os.path.dirname(SPECPATH)
 
 # vgamepad ships ViGEmClient.dll (x64/x86) as package data. PyInstaller does not always
 # pick native DLLs up by itself, so collect them explicitly - without this the app
@@ -14,8 +21,8 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 binaries = collect_dynamic_libs("vgamepad")
 
 a = Analysis(
-    ["pyESS_app.py"],
-    pathex=[],
+    [os.path.join(ROOT, "src", "pyESS_app.py")],
+    pathex=[os.path.join(ROOT, "src")],
     binaries=binaries,
     # NOTE: LICENSE / README / pyESS_zones.json are deliberately NOT listed here.
     # PyInstaller 6 puts datas inside _internal/, but the licence has to be visible
@@ -41,6 +48,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="pyESS",
+    icon=os.path.join(ROOT, "docs", "pyess.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

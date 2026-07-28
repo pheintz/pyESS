@@ -77,6 +77,24 @@ BUTTON_NAMES = {
 }
 
 
+def _icon_path():
+    """docs/pyess.ico next to the source, or beside the exe once frozen."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "pyess.ico")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "docs", "pyess.ico")
+
+
+def _set_window_icon(root):
+    # Cosmetic only - a missing or unreadable icon must never stop the app starting.
+    try:
+        p = _icon_path()
+        if os.path.isfile(p):
+            root.iconbitmap(p)
+    except Exception:
+        pass
+
+
 def _axis_safe(js, idx, default=0.0):
     if idx is None:
         return default
@@ -460,6 +478,7 @@ class App:
         self._known_devices = None
         self._building = True
         root.title(f"pyESS {__version__} - OoT stick shaper")
+        _set_window_icon(root)
         root.minsize(560, 0)
 
         self._build_target(root)
@@ -582,12 +601,6 @@ class App:
         self.map_canvas.create_image(0, 0, anchor="nw", image=self.map_img)
         # crosshair + live stick dot, drawn over the image
         c = MAP_PX / 2
-        # Deflection rings so a zone boundary can be read off as a percentage of throw,
-        # rather than only compared to its neighbours.
-        for frac in (0.25, 0.5, 0.75):
-            r = frac * c
-            self.map_canvas.create_oval(c - r, c - r, c + r, c + r,
-                                        outline="#ffffff", dash=(2, 4))
         self.map_canvas.create_line(c, 0, c, MAP_PX, fill="#8a8a8a")
         self.map_canvas.create_line(0, c, MAP_PX, c, fill="#8a8a8a")
         # Two-tone marker so it reads against all three zone colours. Recreated (not
@@ -609,9 +622,6 @@ class App:
             sw.create_rectangle(0, 0, 12, 12, fill=colour, outline=colour)
             sw.pack(side="left", padx=(0, 5))
             ttk.Label(r, text=label).pack(side="left")
-
-        ttk.Label(legend, text="dashed rings = 25 / 50 / 75% deflection",
-                  foreground="#888").pack(anchor="w", pady=(8, 0))
 
         self._map_job = None
         self.schedule_map()

@@ -47,7 +47,9 @@ def _base_dir():
     """
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    # Modules live in src/; the config sits one level up beside pyess.bat so it is
+    # findable without digging through source.
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _config_path():
