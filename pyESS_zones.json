@@ -20,7 +20,6 @@
   ],
   "shaping": {
     "deadzone": 0.08,
-    "ess_enable": true,
     "octagon_cardinal": 1.0,
     "octagon_diagonal": 0.7,
     "ess_zone_size": 0.25

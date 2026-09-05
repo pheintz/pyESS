@@ -116,7 +116,7 @@ def shape(lx, ly, cfg):
     if dmag <= 0.0:
         return 0.0, 0.0
     m = min(dmag, 1.0)
-    new_mag = ess_remap_magnitude(m, cfg) if cfg.get("ess_enable", True) else m
+    new_mag = ess_remap_magnitude(m, cfg)
     ux, uy = dx / dmag, dy / dmag
     return clamp_octagon(ux * new_mag, uy * new_mag,
                          cfg["octagon_cardinal"], cfg["octagon_diagonal"])

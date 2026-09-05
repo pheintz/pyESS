@@ -1,15 +1,27 @@
 name: release
 
-# Publishes a release when you push a version tag:
-#   git tag v1.0.0 && git push origin v1.0.0
-# workflow_dispatch is there so you can dry-run the build without tagging.
+# Three ways in:
+#   * push to master    - the normal path. Bumps the patch, builds, tags, releases.
+#   * push a v* tag     - the manual path, kept for cutting a specific version by hand.
+#                         The tag must already match __version__; nothing is rewritten.
+#   * workflow_dispatch - dry run. Builds and uploads the artifact, tags nothing.
+#
+# To push to master WITHOUT releasing, put [skip ci] in the commit message - GitHub
+# skips the whole workflow run.
 on:
   push:
+    branches: [master]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write        # required to create the release and upload the zip
+  contents: write        # required to push the bump commit, the tag, and the release
+
+# Two pushes landing together must not race for the same version number. Queue them
+# rather than cancelling: a cancelled run could leave a tag pushed with no release.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -19,30 +31,77 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history and, more to the point, every tag - the bump walks the tag
+          # list to find a free version number.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"     # 3.11+ required: the 1kHz pacer needs a
                                      # high-resolution time.sleep on Windows
 
+      # Works out what version this run ships and, on the auto path, rewrites
+      # __version__ in the working tree. Nothing is committed here - the bump is only
+      # pushed once the build and smoke test have actually passed, so a failed build
+      # leaves master untouched.
+      - name: Decide version
+        id: ver
+        run: |
+          $src = 'src/pyESS_app.py'
+          $raw = Get-Content $src -Raw
+          if ($raw -notmatch '(?m)^__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+            Write-Error "no parsable __version__ in $src"
+            exit 1
+          }
+          $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]
+          $cur = "$maj.$min.$pat"
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            # Manual path. Fail loudly if the tag and __version__ disagree - otherwise
+            # you ship v1.1.0 containing a binary that reports 1.0.0.
+            $ver = "${{ github.ref_name }}" -replace '^v', ''
+            if ($ver -ne $cur) {
+              Write-Error "Tag $ver does not match __version__ $cur - bump src/pyESS_app.py"
+              exit 1
+            }
+            "bump=false"   >> $env:GITHUB_OUTPUT
+            "release=true" >> $env:GITHUB_OUTPUT
+          }
+          elseif ("${{ github.event_name }}" -eq "push") {
+            # Auto path. Start at patch+1 and keep walking until the tag is free, so a
+            # re-run - or a __version__ that has drifted behind the tags - still lands
+            # on something unused instead of colliding.
+            do {
+              $pat++
+              $ver = "$maj.$min.$pat"
+              $taken = git tag -l "v$ver"
+            } while (-not [string]::IsNullOrEmpty($taken))
+
+            # Rewrite in place via .NET so the existing line endings and encoding
+            # survive untouched - the diff must be this one line and nothing else.
+            $new = '__version__ = "' + $ver + '"'
+            $raw = $raw -replace '(?m)^__version__\s*=\s*"[^"]*"', $new
+            [System.IO.File]::WriteAllText((Resolve-Path $src), $raw)
+            Write-Host "bumping $cur -> $ver"
+            "bump=true"    >> $env:GITHUB_OUTPUT
+            "release=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+            # workflow_dispatch: build what is here, ship nothing.
+            $ver = $cur
+            "bump=false"    >> $env:GITHUB_OUTPUT
+            "release=false" >> $env:GITHUB_OUTPUT
+          }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "zip=pyESS-$ver-win64.zip" >> $env:GITHUB_OUTPUT
+          Write-Host "this run ships $ver"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller==6.21.0
-
-      # Fail early and loudly if the tag and __version__ disagree - otherwise you
-      # ship v1.1.0 containing a binary that reports 1.0.0.
-      - name: Check tag matches __version__
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          $tag = "${{ github.ref_name }}" -replace '^v',''
-          $ver = (python src/pyESS_app.py --version) -replace '^pyESS ',''
-          Write-Host "tag=$tag  __version__=$ver"
-          if ($tag -ne $ver) {
-            Write-Error "Tag $tag does not match __version__ $ver - bump pyESS_app.py"
-            exit 1
-          }
 
       # The gate. Needs no controller and no display: it exercises the shaping and
       # the VC inversion and asserts the two targets still agree.
@@ -58,38 +117,56 @@ jobs:
         run: |
           Copy-Item LICENSE, README.md, pyESS_zones.json, docs/pyess.ico dist/pyESS/
 
+      # Also confirms the bump actually reached the binary: if the rewrite silently
+      # missed, the exe reports the old number and this stops the release.
       - name: Smoke-test the built exe
         run: |
-          ./dist/pyESS/pyESS.exe --version
+          $want = "${{ steps.ver.outputs.version }}"
+          $got = (./dist/pyESS/pyESS.exe --version) -replace '^pyESS ', ''
+          Write-Host "exe reports $got, expected $want"
+          if ($got -ne $want) {
+            Write-Error "built exe reports $got, not $want"
+            exit 1
+          }
           ./dist/pyESS/pyESS.exe --selftest
 
       - name: Package
-        id: pkg
-        run: |
-          $ver = (python src/pyESS_app.py --version) -replace '^pyESS ',''
-          $zip = "pyESS-$ver-win64.zip"
-          Compress-Archive -Path dist/pyESS/* -DestinationPath $zip -Force
-          "zip=$zip" >> $env:GITHUB_OUTPUT
-          "version=$ver" >> $env:GITHUB_OUTPUT
+        run: Compress-Archive -Path dist/pyESS/* -DestinationPath "${{ steps.ver.outputs.zip }}" -Force
 
-      # Always keep the build, even on a manual dispatch with no tag.
+      # Always keep the build, even on a dry run that tags nothing.
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pkg.outputs.zip }}
-          path: ${{ steps.pkg.outputs.zip }}
+          name: ${{ steps.ver.outputs.zip }}
+          path: ${{ steps.ver.outputs.zip }}
+
+      # Only now, with a binary that built, ran and reported the right version, does
+      # anything get written back. [skip ci] keeps ci.yml off the bump commit; the push
+      # itself cannot re-trigger this workflow because pushes authored with
+      # GITHUB_TOKEN do not raise workflow events.
+      - name: Commit, tag and push the bump
+        if: steps.ver.outputs.bump == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/pyESS_app.py
+          git commit -m "release v${{ steps.ver.outputs.version }} [skip ci]"
+          git tag "v${{ steps.ver.outputs.version }}"
+          # HEAD is detached on a push event, so name the target branch explicitly.
+          git push origin HEAD:master
+          git push origin "v${{ steps.ver.outputs.version }}"
 
       # Idempotent on purpose. `gh release create` FAILS if the release already exists,
       # which it will if the tag was released from the web UI first, or if this job is
       # re-run. So: create only when missing, then upload with --clobber either way.
       - name: Create or update release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: steps.ver.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @"
           ## Install
 
-          1. Download and extract ``${{ steps.pkg.outputs.zip }}``
+          1. Download and extract ``${{ steps.ver.outputs.zip }}``
           2. **Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)** - required.
              It is a kernel driver and cannot be bundled; without it the app cannot create
              the virtual controller.
@@ -105,24 +182,24 @@ jobs:
           [Skuzee/ESS-Adapter](https://github.com/Skuzee/ESS-Adapter).
           "@
           $notes | Out-File -FilePath notes.md -Encoding utf8
-          $tag = "${{ github.ref_name }}"
+          $tag = "v${{ steps.ver.outputs.version }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "creating release $tag"
             gh release create $tag `
-              --title "pyESS ${{ steps.pkg.outputs.version }}" `
+              --title "pyESS ${{ steps.ver.outputs.version }}" `
               --notes-file notes.md `
               --generate-notes
             if ($LASTEXITCODE -ne 0) { exit 1 }
           } else {
             Write-Host "release $tag already exists - updating notes"
             gh release edit $tag `
-              --title "pyESS ${{ steps.pkg.outputs.version }}" `
+              --title "pyESS ${{ steps.ver.outputs.version }}" `
               --notes-file notes.md
           }
 
           # --clobber so a re-run replaces the asset instead of erroring on a duplicate
-          gh release upload $tag "${{ steps.pkg.outputs.zip }}" --clobber
+          gh release upload $tag "${{ steps.ver.outputs.zip }}" --clobber
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Write-Host "uploaded ${{ steps.pkg.outputs.zip }}"
+          Write-Host "uploaded ${{ steps.ver.outputs.zip }}"

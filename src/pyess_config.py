@@ -18,7 +18,6 @@ CONFIG_FILENAME = "pyESS_zones.json"
 # Built-in fallback (kept identical to the shipped pyESS_zones.json "shaping" block).
 DEFAULT_SHAPING = {
     "deadzone": 0.088,
-    "ess_enable": True,
     "ess_zone_size": 0.35,
     # derived from the game constants, not user-tunable - see pyess_shaping
     "ess_output_start": ess_output_band()[0],
@@ -35,6 +34,11 @@ DEFAULT_TARGETS = {
 # Per-target (non-shaping) keys that save_zones is allowed to persist.
 TARGET_KEYS = ("max_axis_range", "gate_compensation", "input_lag_ms",
                "soh_deadzone", "soh_sensitivity")
+
+# Keys that used to live in the "shaping" block and no longer do. Dropped both on
+# load and on save, so an old config stops carrying dead settings that still look
+# meaningful. ess_enable is here because the ESS remap is unconditional now.
+RETIRED_SHAPING_KEYS = ("ess_input_start", "ess_input_end", "ess_enable")
 
 
 def _base_dir():
@@ -83,8 +87,6 @@ def _coerce(cfg, warn):
                 cfg[key] = fallback
         else:
             cfg[key] = float(val)
-    if not isinstance(cfg.get("ess_enable", True), bool):
-        cfg["ess_enable"] = bool(cfg.get("ess_enable"))
     return cfg
 
 
@@ -145,8 +147,8 @@ def load_zones(target, verbose=True):
     # Migrate the old two-key form. ess_input_start is gone: only 0 was ever correct.
     if "ess_zone_size" not in cfg and "ess_input_end" in cfg:
         cfg["ess_zone_size"] = cfg["ess_input_end"]
-    cfg.pop("ess_input_start", None)
-    cfg.pop("ess_input_end", None)
+    for _k in RETIRED_SHAPING_KEYS:
+        cfg.pop(_k, None)
 
     # The output band is fixed by the game; re-derive it so an old or hand-edited
     # value cannot bring back the dead-diagonal corners.
@@ -183,6 +185,10 @@ def save_zones(cfg, target=None):
             raw = {}
 
     shaping = raw.get("shaping") or {}
+    # Strip retired keys: SHAPING_KEYS no longer names them, so without this they
+    # would survive in the file forever - never overwritten, never removed.
+    for k in RETIRED_SHAPING_KEYS:
+        shaping.pop(k, None)
     for k in SHAPING_KEYS:
         if k in cfg:
             shaping[k] = cfg[k]
@@ -210,7 +216,7 @@ def describe(cfg):
     lines = [f"[zones] target={cfg['_target']}  source={cfg['_source']}"]
     mar = cfg.get("max_axis_range", 85.0)
     lines.append(
-        f"[zones] deadzone={cfg['deadzone']}  ess_enable={cfg['ess_enable']}  "
+        f"[zones] deadzone={cfg['deadzone']}  "
         f"octagon={cfg['octagon_cardinal']}/{cfg['octagon_diagonal']}")
     lines.append(
         f"[zones] ess_input  {cfg['ess_input_start']}..{cfg['ess_input_end']}   "

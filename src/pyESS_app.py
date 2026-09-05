@@ -552,7 +552,7 @@ class App:
         self._push()
 
     def _build_zones(self, root):
-        f = ttk.LabelFrame(root, text="Zones (live)", padding=8)
+        f = ttk.LabelFrame(root, text="Zones", padding=8)
         f.pack(fill="both", expand=True, padx=8, pady=4)
         cfg = self.engine.cfg
         for i, (key, label, lo, hi) in enumerate(ZONE_SPECS):
@@ -570,13 +570,8 @@ class App:
         f.columnconfigure(1, weight=1)
 
         r = len(ZONE_SPECS)
-        self.ess_var = tk.BooleanVar(value=bool(cfg.get("ess_enable", True)))
-        ttk.Checkbutton(f, text="ESS band enabled", variable=self.ess_var,
-                        command=lambda: self.on_zone("ess_enable")).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
         btns = ttk.Frame(f)
-        btns.grid(row=r + 1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        btns.grid(row=r, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.btn_save = ttk.Button(btns, text="Save", command=self.on_save)
         self.btn_save.pack(side="left")
         ttk.Button(btns, text="Reload from file", command=self.on_reload).pack(side="left", padx=6)
@@ -588,8 +583,7 @@ class App:
     def _build_map(self, root):
         """2D map of PHYSICAL stick space, coloured by the resulting in-game state.
         Answers the question the sliders can't: 'where do I hold the stick for ESS?'"""
-        f = ttk.LabelFrame(root, text="Zone map (physical stick -> in-game state)",
-                           padding=8)
+        f = ttk.LabelFrame(root, text="Zone map", padding=8)
         f.pack(fill="x", padx=8, pady=4)
         row = ttk.Frame(f)
         row.pack(fill="x")
@@ -716,7 +710,6 @@ class App:
         cfg = dict(self.engine.cfg)
         for key, var in self.vars.items():
             cfg[key] = float(var.get())
-        cfg["ess_enable"] = bool(self.ess_var.get())
         if self.target_var.get() == "pc":          # these three are SoH-only
             cfg["input_lag_ms"] = float(self.lag_var.get())
         else:
@@ -816,7 +809,6 @@ class App:
                 var.set(float(cfg[key]))
                 var._entry.delete(0, "end")
                 var._entry.insert(0, f"{var.get():.3f}")
-        self.ess_var.set(bool(cfg.get("ess_enable", True)))
         if "input_lag_ms" in cfg:
             self.lag_var.set(float(cfg["input_lag_ms"]))
         self._building = False
