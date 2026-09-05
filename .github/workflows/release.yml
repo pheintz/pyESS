@@ -97,7 +97,32 @@ jobs:
           "zip=pyESS-$ver-win64.zip" >> $env:GITHUB_OUTPUT
           Write-Host "this run ships $ver"
 
+      # vgamepad is source-only on PyPI (no wheels, any version), so pip must run its
+      # setup.py - and that setup.py launches the ViGEmBus MSI via `msiexec /i`, an
+      # INTERACTIVE GUI, whenever it cannot find the driver in the registry. On a runner
+      # nobody clicks Next, so the install hangs forever at "Preparing metadata". Older
+      # pip dodged it because setup.py skips the installer for `egg_info`; modern pip
+      # prepares metadata with `dist_info`, which is not in that skip list.
+      #
+      # Its detection is a plain string search over `reg query ...\Uninstall /s`, so
+      # seeding that key is enough to make it skip the installer. Safe here because CI
+      # never creates a virtual pad: --selftest imports neither pygame nor vgamepad
+      # (both are imported lazily in the input loop) and the build only needs the
+      # ViGEmClient.dll shipped inside the package. Real users still install the real
+      # driver - the release notes tell them to.
+      - name: Stub the ViGEmBus registry entry
+        run: |
+          $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ViGEmBus"
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name DisplayName -PropertyType String -Force `
+            -Value "Nefarius Virtual Gamepad Emulation Bus Driver" | Out-Null
+          New-ItemProperty -Path $key -Name DisplayVersion -PropertyType String -Force `
+            -Value "1.17.333.0" | Out-Null
+          Write-Host "seeded $key so vgamepad's setup.py skips its interactive installer"
+
       - name: Install dependencies
+        # A hang here used to sit until the job limit; fail in minutes instead.
+        timeout-minutes: 10
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
