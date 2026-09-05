@@ -29,16 +29,27 @@ GAME_WALK_CUR = 27          # first cur value that walks (= walk magnitude 20 + 
 
 
 def ess_output_band(max_axis_range=85.0):
-    """Return (start, end) normalised output magnitudes for the ESS plateau.
+    """Return (start, end) normalised output magnitudes for the ESS band.
 
-    FLAT (start == end): every ESS value is functionally identical in game, so a flat
-    plateau maximises the margin at both ends - you cannot drift out of ESS anywhere
-    inside the input window.
+    SPANNING (start < end): the input window ramps linearly across the whole in-game
+    ESS band rather than pinning to a single value. Every magnitude inside the band is
+    functionally identical in game, so this changes NOTHING mechanically - but it keeps
+    stick movement visible in the input viewer and telemetry instead of flatlining on
+    one number (cur ~18.7) across the first third of stick travel.
+
+    This replaced a FLAT band (start == end == the midpoint, 18.655/85). Flat maximised
+    margin at both ends - you could not drift out of ESS anywhere inside the window -
+    but it also collapsed 20 of the ~64 reachable stick levels onto a single output,
+    which is what made the viewer unrepresentative.
+
+    The trade is margin for representativeness: at the extremes of the input window the
+    output now sits ON the band edges (the 11.31 diagonal floor and the 26 walk
+    threshold) instead of centred between them. To buy margin back, inset lo/hi - e.g.
+    lo + 1.5 and hi - 1.5 keeps a visible ramp while staying clear of both edges.
     """
     lo = (GAME_DEADZONE + 1) * math.sqrt(2.0)      # diagonal survives  = 11.31
     hi = float(GAME_WALK_CUR - 1)                  # cardinal still ESS = 26
-    mid = (lo + hi) / 2.0 / max_axis_range
-    return mid, mid
+    return lo / max_axis_range, hi / max_axis_range
 
 
 def clamp(v, lo, hi):

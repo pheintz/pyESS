@@ -53,10 +53,10 @@ MAP_SAMPLES = 80         # grid actually evaluated (each cell drawn MAP_PX/MAP_S
 MAP_NEUTRAL, MAP_ESS = "#1b1f27", "#f0a92e"
 MAP_WALK, MAP_RUN, MAP_FULLRUN = "#a8e6d4", "#4a9fc4", "#15456b"
 
-# Zone sliders: (key, label, min, max, tooltip-ish description)
+# Zone sliders: (key, label, min, max)
 ZONE_SPECS = [
-    ("deadzone",         "Deadzone",          0.0,  0.50, "Square per-axis dead box; range rescaled after it"),
-    ("ess_zone_size",    "ESS zone size",     0.0,  1.00, "How much stick past the deadzone holds ESS"),
+    ("deadzone",      "Deadzone",      0.0, 0.50),
+    ("ess_zone_size", "ESS zone size", 0.0, 1.00),
 ]
 # ESS always starts where the deadzone ends - a gap would reintroduce dead corners.
 # ess_output_* is DERIVED (pyess_shaping.ess_output_band) - the in-game ESS band is
@@ -555,7 +555,7 @@ class App:
         f = ttk.LabelFrame(root, text="Zones (live)", padding=8)
         f.pack(fill="both", expand=True, padx=8, pady=4)
         cfg = self.engine.cfg
-        for i, (key, label, lo, hi, desc) in enumerate(ZONE_SPECS):
+        for i, (key, label, lo, hi) in enumerate(ZONE_SPECS):
             ttk.Label(f, text=label, width=17).grid(row=i, column=0, sticky="w", pady=1)
             var = tk.DoubleVar(value=float(cfg.get(key, 0.0)))
             self.vars[key] = var
@@ -567,7 +567,6 @@ class App:
             ent.insert(0, f"{var.get():.3f}")
             ent.bind("<Return>", lambda _e, k=key: self.on_entry(k))
             var._entry = ent
-            ttk.Label(f, text=desc, foreground="#888").grid(row=i, column=3, sticky="w", padx=(6, 0))
         f.columnconfigure(1, weight=1)
 
         r = len(ZONE_SPECS)
@@ -611,11 +610,11 @@ class App:
 
         legend = ttk.Frame(row)
         legend.pack(side="left", padx=12, anchor="n")
-        for colour, label in ((MAP_NEUTRAL, "NEUTRAL  (deadzone)"),
-                              (MAP_ESS, "ESS  (pivot in place)"),
-                              (MAP_WALK, "WALK  (speed ramps)"),
-                              (MAP_RUN, "RUN  (still ramping)"),
-                              (MAP_FULLRUN, "FULL RUN  (max speed)")):
+        for colour, label in ((MAP_NEUTRAL, "NEUTRAL"),
+                              (MAP_ESS, "ESS"),
+                              (MAP_WALK, "WALK"),
+                              (MAP_RUN, "RUN"),
+                              (MAP_FULLRUN, "FULL RUN")):
             r = ttk.Frame(legend)
             r.pack(anchor="w", pady=1)
             sw = tk.Canvas(r, width=12, height=12, highlightthickness=0)
@@ -690,8 +689,6 @@ class App:
         self.lbl_pass.pack(anchor="w")
         self.bar = ttk.Progressbar(f, maximum=60.0, length=380)
         self.bar.pack(fill="x", pady=(4, 0))
-        ttk.Label(f, text="in-game magnitude   0 ......... 20 (walk) ......... 60",
-                  foreground="#888").pack(anchor="w")
 
         # Collapsed by default: essential when diagnosing a pad whose buttons do not
         # match the standard layout, pure clutter the rest of the time.

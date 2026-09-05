@@ -19,17 +19,17 @@
     "raw cur 8..26, and cur 27 walks."
   ],
   "shaping": {
-    "deadzone": 0.0,
+    "deadzone": 0.08,
     "ess_enable": true,
     "octagon_cardinal": 1.0,
     "octagon_diagonal": 0.7,
-    "ess_zone_size": 0.35
+    "ess_zone_size": 0.25
   },
   "targets": {
     "soh": {
       "_note": "pyESS_n64geo.py -> Ship of Harkinian. libultraship MAX_AXIS_RANGE=85. input_lag_ms deliberately delays output 0..100ms (SoH only; a testing/handicap aid). Reference: the MEASURED WiiVC penalty over N64 is +33.8ms (95% CI 24.8-42.8, n=43, 240fps camera) = ~2 polls at 60Hz, so 33 is the value to use if you want SoH to match Dolphin-WiiVC.",
       "max_axis_range": 85.0,
-      "input_lag_ms": 32.62411347517731,
+      "input_lag_ms": 7.6923076923076925,
       "soh_deadzone": 0.0,
       "soh_sensitivity": 1.0
     },
