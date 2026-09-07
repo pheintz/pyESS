@@ -14,10 +14,14 @@
     "  octagon_*        gate: |x|<=cardinal, |y|<=cardinal, |x|+|y|<=2*diagonal.",
     "                   Requires cardinal/2 < diagonal < cardinal.",
     "",
+    "selected_target is TOP-LEVEL, not shaping: it is the GUI output-target radio",
+    "('pc' or 'dolphin'), remembered the moment you click it rather than on Save.",
+    "",
     "REFERENCE (decomp-verified): OoT applies its own square deadzone of 7 and clamps",
     "raw cur at 67; magnitude <20 = ESS (pivot in place), >=20 walks. So in-game ESS is",
     "raw cur 8..26, and cur 27 walks."
   ],
+  "selected_target": "dolphin",
   "shaping": {
     "deadzone": 0.08,
     "octagon_cardinal": 1.0,

@@ -40,6 +40,13 @@ TARGET_KEYS = ("max_axis_range", "gate_compensation", "input_lag_ms",
 # meaningful. ess_enable is here because the ESS remap is unconditional now.
 RETIRED_SHAPING_KEYS = ("ess_input_start", "ess_input_end", "ess_enable")
 
+# The GUI's output-target radio. This is app-level UI state, not shaping, so it lives at
+# the TOP level of the config - not in "shaping" (the shared curve) or "targets"
+# (per-target tuning). Values are the GUI's own keys; "pc" maps to the "soh" target.
+SELECTED_TARGET_KEY = "selected_target"
+UI_TARGETS = ("pc", "dolphin")
+DEFAULT_UI_TARGET = "dolphin"
+
 
 def _base_dir():
     """Where pyESS_zones.json lives.
@@ -208,6 +215,58 @@ def save_zones(cfg, target=None):
         json.dump(raw, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, path)   # atomic-ish; never leaves a half-written config
+    return path
+
+
+def load_selected_target(verbose=False):
+    """Which output target the GUI had selected last.
+
+    Falls back to DEFAULT_UI_TARGET for a missing, unreadable or unrecognised value: a
+    bad preference must never be the reason the app will not start.
+    """
+    path = _config_path()
+    if not os.path.isfile(path):
+        return DEFAULT_UI_TARGET
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            val = json.load(fh).get(SELECTED_TARGET_KEY)
+    except Exception:
+        return DEFAULT_UI_TARGET
+    if val in UI_TARGETS:
+        return val
+    if val is not None and verbose:
+        print(f"[pyess_config] WARNING: {SELECTED_TARGET_KEY}={val!r} is not one of "
+              f"{UI_TARGETS} - using {DEFAULT_UI_TARGET}", file=sys.stderr)
+    return DEFAULT_UI_TARGET
+
+
+def save_selected_target(target):
+    """Persist ONLY the radio selection; 'shaping' and 'targets' are left untouched.
+
+    Deliberately not routed through save_zones. The radio is remembered the moment it
+    is clicked, while tuning values stay behind the Save button - writing the whole
+    config here would silently persist unsaved slider edits along with it.
+
+    Returns the path written, or None if the config exists but could not be parsed.
+    """
+    if target not in UI_TARGETS:
+        raise ValueError(f"unknown target {target!r}; expected one of {UI_TARGETS}")
+    path = _config_path()
+    raw = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception:
+            # Exists but will not parse - most likely a hand-edit in progress. Refuse
+            # to write: clobbering a config to remember a radio button is a bad trade.
+            return None
+    raw[SELECTED_TARGET_KEY] = target
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)   # same atomic-ish write save_zones uses
     return path
 
 

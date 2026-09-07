@@ -25,7 +25,8 @@ from tkinter import ttk, messagebox
 
 import pyess_shaping as shaping
 import pyess_vc as vc
-from pyess_config import load_zones, save_zones, TARGET_KEYS
+from pyess_config import (load_zones, save_zones, TARGET_KEYS,
+                          load_selected_target, save_selected_target)
 
 HZ = 1000                # poll/emit rate. The loop period is the DOMINANT latency
                          # term: compute is ~5us (SoH) / ~10us (Dolphin), so at 250Hz
@@ -112,8 +113,10 @@ def _axis_safe(js, idx, default=0.0):
 class Engine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self.cfg = load_zones("dolphin", verbose=False)
-        self.target = "dolphin"
+        # Start on whichever target was last ticked, not a hardcoded one.
+        self.target = load_selected_target()
+        self.cfg = load_zones("dolphin" if self.target == "dolphin" else "soh",
+                              verbose=False)
         self.device_index = 0
         self._stop = threading.Event()
         self._restart = threading.Event()
@@ -767,6 +770,13 @@ class App:
             else:
                 cfg.pop(k, None)
         self.engine.cfg = cfg
+        # Remembered as soon as it is clicked rather than on Save: this is a UI
+        # preference, not a tuning value. A failed write must not block switching
+        # target, and a modal on every radio click would be worse than forgetting it.
+        try:
+            save_selected_target(self.engine.target)
+        except Exception:
+            pass
 
     def refresh_devices(self):
         """List real controller names. Enumerating needs pygame, which the engine owns,
