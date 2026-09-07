@@ -269,28 +269,3 @@ def save_selected_target(target):
     os.replace(tmp, path)   # same atomic-ish write save_zones uses
     return path
 
-
-def describe(cfg):
-    """One-line-per-key summary of what actually got loaded (for --selftest)."""
-    lines = [f"[zones] target={cfg['_target']}  source={cfg['_source']}"]
-    mar = cfg.get("max_axis_range", 85.0)
-    lines.append(
-        f"[zones] deadzone={cfg['deadzone']}  "
-        f"octagon={cfg['octagon_cardinal']}/{cfg['octagon_diagonal']}")
-    lines.append(
-        f"[zones] ess_input  {cfg['ess_input_start']}..{cfg['ess_input_end']}   "
-        f"ess_output {cfg['ess_output_start']}..{cfg['ess_output_end']}"
-        f"  (= cur {cfg['ess_output_start']*mar:.1f}..{cfg['ess_output_end']*mar:.1f})")
-    if "gate_compensation" in cfg:
-        gc = cfg["gate_compensation"]
-        lines.append(f"[zones] max_axis_range={mar}  gate_compensation={gc}"
-                     f"{'  (no-op)' if gc == 1.0 else '  (ACTIVE)'}")
-    else:
-        lines.append(f"[zones] max_axis_range={mar}")
-    return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    for t in ("soh", "dolphin"):
-        print(describe(load_zones(t)))
-        print()
