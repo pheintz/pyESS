@@ -1,12 +1,11 @@
-# pyess_vc.py
-# WiiVC stick-map inversion + a decomp-accurate model of OoT's own stick handling.
-#
-# The inversion tables and algorithm are ported from Skuzee's ESS-Adapter
-# (generate-map.py / ESS.cpp), which is GPLv3. This file is therefore GPLv3.
-#
-# VC distortion model: extra deadzone 15, length clamp 56, per-axis 1-sqrt(1-x) curve.
-# Feed invert_vc_n64() the raw `cur` you WANT in game; it returns the GC byte that,
-# after VC mangles it, produces that value.
+"""WiiVC stick-map inversion plus a decomp-accurate model of OoT stick handling.
+
+Give invert_vc_n64() the raw `cur` you want in game; it returns the GC byte that
+produces it after VC distortion (deadzone 15, length clamp 56, 1-sqrt(1-x) curve).
+
+Tables and algorithm ported from Skuzee's ESS-Adapter (generate-map.py / ESS.cpp),
+GPLv3 - so this file is GPLv3.
+"""
 
 import math
 
@@ -149,22 +148,14 @@ GAME_RAW_MAX = 67
 GAME_WALK_MAG = 20
 GAME_MAG_MAX = 60
 
-# Walk -> run. z_player.c (idle action, ~line 8244):
-#     Player_GetMovementSpeedAndYaw(..., SPEED_MODE_LINEAR, ...)
-#     if (speedTarget > 4.9f) { ...run anim... }
-#     if (speedTarget != 0.0f) { ...walk anim... }
-# SPEED_MODE_LINEAR is  speed = magnitude * 0.8 * 0.14,  so the switch is a fixed
-# magnitude: 4.9 / 0.112 = 43.75  (cardinal raw cur ~51). Flat ground only - a floor
-# pitch subtracts 8*sin(pitch)^2 and pushes the boundary outward.
+# Walk -> run. z_player.c idle action: SPEED_MODE_LINEAR gives speed = mag * 0.8 * 0.14
+# and runs above 4.9, so the switch is a fixed magnitude of 43.75 (cardinal cur ~51).
+# Flat ground only - floor pitch pushes the boundary outward.
 GAME_RUN_SPEED = 4.9
 GAME_RUN_MAG = GAME_RUN_SPEED / (0.8 * 0.14)          # 43.75
 
-# Run -> FULL RUN. The two states use DIFFERENT formulas:
-#   Player_Action_80840DE4 (walk) uses SPEED_MODE_LINEAR  -> speed = mag * 0.8 * 0.14
-#   Player_Action_80842180 (run)  uses SPEED_MODE_CURVED  -> the cosine curve below,
-#                                                            CLAMPed to speedCap.
-# So RUN is still progressive (speed 1.95 at mag 43.75, climbing); only past the cap is
-# speed actually constant. speedCap = R_RUN_SPEED_LIMIT/100 = sBootData[boots][9]/100.
+# Run -> FULL RUN. Walk uses SPEED_MODE_LINEAR, run uses SPEED_MODE_CURVED (below)
+# clamped to speedCap, so RUN is still progressive until the cap is reached.
 GAME_SPEED_CAP = 600 / 100.0                          # normal boots
 
 

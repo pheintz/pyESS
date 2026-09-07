@@ -285,15 +285,24 @@ jobs:
             exit 1
           }
 
+          # Resolve the REAL gh executable once. PowerShell command lookup is
+          # case-insensitive and prefers functions over applications, so a helper named
+          # `Gh` turned every `& gh` into a call to itself - the step died with "call
+          # depth overflow" instead of publishing. Binding -CommandType Application
+          # makes that class of collision impossible regardless of the helper's name.
+          $ghExe = (Get-Command gh -CommandType Application | Select-Object -First 1).Source
+          if (-not $ghExe) { throw "gh CLI not found on PATH" }
+          Write-Host "using gh at $ghExe"
+
           # Retry every gh call. The tag and bump commit are already pushed by now, so a
           # transient 5xx here strands a version with no release - and a re-run cannot
           # repair it: it replays the ORIGINAL trigger SHA, reads the pre-bump
           # __version__, sees this tag taken, picks the NEXT number, then fails its own
           # push as non-fast-forward. The orphan is then permanent and manual to fix.
           # Retrying does not close that window, but it removes its commonest cause.
-          function Gh([string[]]$argv, [string]$what) {
+          function Invoke-GhRetry([string[]]$argv, [string]$what) {
             for ($i = 1; $i -le 3; $i++) {
-              & gh @argv
+              & $ghExe @argv
               if ($LASTEXITCODE -eq 0) { return }
               if ($i -lt 3) {
                 Write-Host "  $what failed (exit $LASTEXITCODE) - retry $i/3"
@@ -305,25 +314,25 @@ jobs:
           }
 
           $title = "pyESS ${{ steps.ver.outputs.version }}"
-          gh release view $tag *> $null
+          & $ghExe release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "creating release $tag"
             # --prerelease: the pipeline never publishes a final release. It stays
             # flagged (and off "Latest") until a human promotes it - see the comment
             # on the update branch below for why we never re-apply this on a re-run.
-            Gh @("release", "create", $tag, "--title", $title,
+            Invoke-GhRetry @("release", "create", $tag, "--title", $title,
                  "--notes-file", "notes.md", "--generate-notes", "--prerelease") "release create"
           } else {
             # Deliberately NO --prerelease here. If you have already promoted this
             # release by hand, a re-run must not silently demote it back.
             Write-Host "release $tag already exists - updating notes, leaving its"
             Write-Host "  pre-release flag exactly as you left it"
-            Gh @("release", "edit", $tag, "--title", $title,
+            Invoke-GhRetry @("release", "edit", $tag, "--title", $title,
                  "--notes-file", "notes.md") "release edit"
           }
 
           # --clobber so a re-run replaces the asset instead of erroring on a duplicate
-          Gh @("release", "upload", $tag, "${{ steps.ver.outputs.zip }}", "--clobber") "release upload"
+          Invoke-GhRetry @("release", "upload", $tag, "${{ steps.ver.outputs.zip }}", "--clobber") "release upload"
           Write-Host "uploaded ${{ steps.ver.outputs.zip }}"
           Write-Host "$tag is a PRE-RELEASE - promote it when you are ready:"
           Write-Host "  gh release edit $tag --prerelease=false --latest"

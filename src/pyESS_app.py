@@ -1,16 +1,13 @@
-# pyESS_app.py
-# Single combined application: live-editable zone GUI + switchable output target.
-#
-#   PC / Ship of Harkinian : shaped -> int16 -> virtual X360 pad -> SoH
-#   Dolphin / WiiVC        : shaped -> raw cur -> INVERT VC -> GC byte -> X360 -> Dolphin
-#
-# Both targets share the SAME shaping curve (pyess_shaping), so switching output does
-# not change the feel - only how the value is delivered. Zone edits apply instantly to
-# the running remap loop; "Save" persists them to pyESS_zones.json.
-#
-# Contains GPLv3 code by way of pyess_vc (Skuzee ESS-Adapter port) -> this app is GPLv3.
-#
-# Run:  python pyESS_app.py
+"""Live-editable zone GUI with a switchable output target.
+
+    PC / Ship of Harkinian : shaped -> int16 -> virtual X360 pad -> SoH
+    Dolphin / WiiVC        : shaped -> raw cur -> invert VC -> GC byte -> X360
+
+Both targets share the same shaping curve, so switching output changes only how the
+value is delivered. Edits apply instantly; "Save" persists them.
+
+GPLv3 - contains code by way of pyess_vc (Skuzee ESS-Adapter port).
+"""
 
 __version__ = "1.0.3"
 
@@ -37,21 +34,9 @@ MAX_LAG_S = 0.15         # keep ~150ms of output history (max lag 100ms + margin
 MAP_PX = 160             # zone-map display size in pixels
 MAP_SAMPLES = 80         # grid actually evaluated (each cell drawn MAP_PX/MAP_SAMPLES px)
                          # 40 gave visibly stepped 4px edges; 160 (per-pixel) cost ~630ms
-# Zone palette: ink / amber / steel-blue.
-#
-# Built on the warm-cool axis rather than red-green, so it survives all three dichromacy
-# types, and scored against Machado et al. (2009) simulation rather than assumed safe:
-# Two CATEGORICAL anchors (ink, amber) plus a 3-step SEQUENTIAL ramp for the movement
-# states. The movement states are ordered, not unrelated, so the ramp is judged on
-# monotonic lightness (0.697 > 0.302 > 0.055 = "faster is deeper") rather than on
-# categorical deltaE - forcing 5 mutually-distinct hues would have hurt both looks and
-# accessibility. ESS keeps a hue contrast (warm amber) against every cool movement tone.
-# It beats plain Okabe-Ito on every axis, most of all tritan (38.6 -> 49.4), while the
-# desaturated ink and softened amber read as a deliberate palette rather than warning
-# colours.
-# NOTE: an earlier version outlined zone boundaries in near-black. It looked like a
-# NEUTRAL ring that does not exist and did not appear in the legend, so every colour on
-# the map is now a legend entry and nothing else.
+# Zone palette: warm-cool axis (not red-green) for dichromacy safety, with the ordered
+# movement states on a monotonic-lightness ramp and ESS held apart in warm amber.
+# Every colour on the map is a legend entry - nothing is drawn that is not explained.
 MAP_NEUTRAL, MAP_ESS = "#1b1f27", "#f0a92e"
 MAP_WALK, MAP_RUN, MAP_FULLRUN = "#a8e6d4", "#4a9fc4", "#15456b"
 
@@ -67,9 +52,7 @@ ZONE_SPECS = [
 # pad the clamp barely fires, so they are set-once values that live in pyESS_zones.json.
 
 TARGETS = [("pc", "PC / Ship of Harkinian"), ("dolphin", "Dolphin / WiiVC")]
-# The radio values and the config module's UI_TARGETS are two spellings of one
-# domain. Drift used to fail silently - save_selected_target raised ValueError and
-# on_target swallowed it, so the setting just stopped persisting. Fail at import.
+# One domain, two spellings - drift here used to fail silently, so assert at import.
 assert tuple(k for k, _ in TARGETS) == UI_TARGETS, (
     f"TARGETS {tuple(k for k, _ in TARGETS)} disagrees with UI_TARGETS {UI_TARGETS}")
 
@@ -230,12 +213,8 @@ class Engine(threading.Thread):
         # and rounding first can land on the wrong side of a gap, costing 2 in-game units.
         gc = vc.best_gc(fx, fy)
         def to_i16(g):
-            # Aim a QUARTER of a byte-step above the target byte's lower edge.
-            # Dolphin must convert our i16 back into a GC byte; if it truncates,
-            # sitting exactly on the edge loses 1 (71/72 bytes shift). A +0.25 step
-            # lands inside the window for BOTH truncation and rounding:
-            #   trunc(v)=n needs v in [n, n+1);  round(v)=n needs v in [n-0.5, n+0.5)
-            #   -> intersection [n, n+0.5)
+            # Aim a quarter byte-step above the target byte's lower edge: lands inside
+            # the window whether Dolphin truncates or rounds the i16 back to a byte.
             step = (g - 128) + (0.25 if g > 128 else (-0.25 if g < 128 else 0.0))
             off = step / 128.0
             if gate != 1.0:
@@ -757,10 +736,8 @@ class App:
 
     def on_target(self):
         chosen = self.target_var.get()
-        # A Radiobutton fires its command on EVERY click, not only on a change. Without
-        # this guard, re-clicking the target you are already on reloaded input_lag_ms
-        # from disk and silently threw away an unsaved slider edit - while _set_dirty
-        # was never called, so the indicator still claimed the edit was pending.
+        # Radiobutton fires on every click, not only on a change; re-clicking the
+        # current target would reload from disk and discard unsaved slider edits.
         if chosen == self.engine.target:
             return
         # reload target-specific keys (max_axis_range, gate_compensation, input_lag_ms)
@@ -778,24 +755,18 @@ class App:
                 cfg[k] = fresh[k]
             else:
                 cfg.pop(k, None)
-        # ess_output_* are DERIVED from max_axis_range and are not in TARGET_KEYS, so
-        # _current_cfg() copies the OUTGOING target's band verbatim. With per-target
-        # ranges that silently destroyed the ESS band on a switch - measured ESS -> WALK
-        # at stick 0.30 - until a reload or restart. Take the freshly derived pair.
+        # Derived from max_axis_range and not in TARGET_KEYS, so _current_cfg would
+        # keep the outgoing target's band - measured as ESS -> WALK on a switch.
         cfg["ess_output_start"] = fresh["ess_output_start"]
         cfg["ess_output_end"] = fresh["ess_output_end"]
-        # Publish cfg BEFORE target: the 1kHz loop reads them as two separate loads, so
-        # whichever is written second is the one that can be seen mismatched. Ordering
-        # it this way means a torn read pairs the OLD target with a cfg that already has
-        # its keys, rather than the new target with the old target's cfg.
+        # cfg before target: the 1kHz loop reads them separately, and this ordering
+        # makes a torn read pair the old target with an already-updated cfg.
         self.engine.cfg = cfg
         self.engine.target = chosen
         self._sync_lag_enabled()
         self.schedule_map()          # the map is target-dependent; redraw it
-        # Remembered as soon as it is clicked rather than on Save: this is a UI
-        # preference, not a tuning value. A failed write must not block switching
-        # target, and a modal on every radio click would be worse than forgetting it -
-        # but it must not vanish silently either, so report it on stderr.
+        # UI preference, so it saves on click rather than on Save. A failed write must
+        # not block the switch, but must not vanish either - report it on stderr.
         try:
             save_selected_target(chosen)
         except OSError as e:
