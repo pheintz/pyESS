@@ -146,11 +146,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "requirements install failed" }
           pip install pyinstaller==6.21.0
           if ($LASTEXITCODE -ne 0) { throw "pyinstaller install failed" }
-          # Prove the native dependency actually imports. Without this nothing in
-          # either workflow ever loads vgamepad, so a missing or moved
-          # ViGEmClient.dll first shows up as a crash on the user's machine.
-          python -c "import vgamepad, pygame; print('deps import OK')"
-          if ($LASTEXITCODE -ne 0) { throw "dependency import check failed" }
+          # Check the native payload WITHOUT importing vgamepad. Its __init__ calls
+          # vigem_connect() at module scope, which needs the real ViGEmBus driver, so
+          # `import vgamepad` can NEVER succeed on a runner - it dies with
+          # VIGEM_ERROR_BUS_NOT_FOUND. find_spec locates the package without executing
+          # it, and ViGEmClient.dll is precisely what collect_dynamic_libs() bundles:
+          # if that file moves in a future vgamepad, the build would otherwise ship an
+          # exe that throws the moment a user clicks Start.
+          python -c "import importlib.util,pathlib,sys; s=importlib.util.find_spec('vgamepad'); p=pathlib.Path(s.submodule_search_locations[0])/'win'/'vigem'/'client'/'x64'/'ViGEmClient.dll'; print('ViGEmClient.dll present:', p.is_file()); sys.exit(0 if p.is_file() else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "vgamepad payload check failed - ViGEmClient.dll not where the spec expects it" }
+          python -c "import pygame; print('pygame', pygame.version.ver)"
+          if ($LASTEXITCODE -ne 0) { throw "pygame import failed" }
 
       # The gate. Needs no controller and no display: it exercises the shaping and
       # the VC inversion and asserts the two targets still agree.
