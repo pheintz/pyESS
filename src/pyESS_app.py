@@ -25,8 +25,9 @@ from tkinter import ttk, messagebox
 
 import pyess_shaping as shaping
 import pyess_vc as vc
-from pyess_config import (load_zones, save_zones, TARGET_KEYS,
-                          load_selected_target, save_selected_target)
+from pyess_config import (load_zones, save_zones, TARGET_KEYS, UI_TARGETS,
+                          config_target, load_selected_target,
+                          save_selected_target)
 
 HZ = 1000                # poll/emit rate. The loop period is the DOMINANT latency
                          # term: compute is ~5us (SoH) / ~10us (Dolphin), so at 250Hz
@@ -66,6 +67,11 @@ ZONE_SPECS = [
 # pad the clamp barely fires, so they are set-once values that live in pyESS_zones.json.
 
 TARGETS = [("pc", "PC / Ship of Harkinian"), ("dolphin", "Dolphin / WiiVC")]
+# The radio values and the config module's UI_TARGETS are two spellings of one
+# domain. Drift used to fail silently - save_selected_target raised ValueError and
+# on_target swallowed it, so the setting just stopped persisting. Fail at import.
+assert tuple(k for k, _ in TARGETS) == UI_TARGETS, (
+    f"TARGETS {tuple(k for k, _ in TARGETS)} disagrees with UI_TARGETS {UI_TARGETS}")
 
 # Passthrough mapping (matches the standalone scripts).
 # Only the LEFT stick is shaped; everything else is forwarded untouched.
@@ -115,8 +121,7 @@ class Engine(threading.Thread):
         super().__init__(daemon=True)
         # Start on whichever target was last ticked, not a hardcoded one.
         self.target = load_selected_target()
-        self.cfg = load_zones("dolphin" if self.target == "dolphin" else "soh",
-                              verbose=False)
+        self.cfg = load_zones(config_target(self.target), verbose=False)
         self.device_index = 0
         self._stop = threading.Event()
         self._restart = threading.Event()
@@ -751,15 +756,19 @@ class App:
         self._push()
 
     def on_target(self):
-        self.engine.target = self.target_var.get()
+        chosen = self.target_var.get()
+        # A Radiobutton fires its command on EVERY click, not only on a change. Without
+        # this guard, re-clicking the target you are already on reloaded input_lag_ms
+        # from disk and silently threw away an unsaved slider edit - while _set_dirty
+        # was never called, so the indicator still claimed the edit was pending.
+        if chosen == self.engine.target:
+            return
         # reload target-specific keys (max_axis_range, gate_compensation, input_lag_ms)
-        tgt = "dolphin" if self.engine.target == "dolphin" else "soh"
-        fresh = load_zones(tgt, verbose=False)
+        fresh = load_zones(config_target(chosen), verbose=False)
         if "input_lag_ms" in fresh:                # keep slider in step with the target
             self._building = True
             self.lag_var.set(float(fresh["input_lag_ms"]))
             self._building = False
-        self._sync_lag_enabled()
         cfg = self._current_cfg()
         # Drive this off TARGET_KEYS, never a hand-written list: every per-target key
         # added since (round_compensation, cancel_soh_octagon, soh_*) was silently
@@ -769,14 +778,28 @@ class App:
                 cfg[k] = fresh[k]
             else:
                 cfg.pop(k, None)
+        # ess_output_* are DERIVED from max_axis_range and are not in TARGET_KEYS, so
+        # _current_cfg() copies the OUTGOING target's band verbatim. With per-target
+        # ranges that silently destroyed the ESS band on a switch - measured ESS -> WALK
+        # at stick 0.30 - until a reload or restart. Take the freshly derived pair.
+        cfg["ess_output_start"] = fresh["ess_output_start"]
+        cfg["ess_output_end"] = fresh["ess_output_end"]
+        # Publish cfg BEFORE target: the 1kHz loop reads them as two separate loads, so
+        # whichever is written second is the one that can be seen mismatched. Ordering
+        # it this way means a torn read pairs the OLD target with a cfg that already has
+        # its keys, rather than the new target with the old target's cfg.
         self.engine.cfg = cfg
+        self.engine.target = chosen
+        self._sync_lag_enabled()
+        self.schedule_map()          # the map is target-dependent; redraw it
         # Remembered as soon as it is clicked rather than on Save: this is a UI
         # preference, not a tuning value. A failed write must not block switching
-        # target, and a modal on every radio click would be worse than forgetting it.
+        # target, and a modal on every radio click would be worse than forgetting it -
+        # but it must not vanish silently either, so report it on stderr.
         try:
-            save_selected_target(self.engine.target)
-        except Exception:
-            pass
+            save_selected_target(chosen)
+        except OSError as e:
+            print(f"[pyESS] could not save target preference: {e}", file=sys.stderr)
 
     def refresh_devices(self):
         """List real controller names. Enumerating needs pygame, which the engine owns,
@@ -804,14 +827,14 @@ class App:
         # No success dialog: saving is routine and a modal on every save is friction.
         # The "Save *" / "unsaved changes" indicator already reports the state.
         try:
-            tgt = "dolphin" if self.engine.target == "dolphin" else "soh"
+            tgt = config_target(self.engine.target)
             save_zones(self._current_cfg(), tgt)
             self._set_dirty(False)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
     def on_reload(self):
-        tgt = "dolphin" if self.engine.target == "dolphin" else "soh"
+        tgt = config_target(self.engine.target)
         cfg = load_zones(tgt, verbose=False)
         self._building = True
         for key, var in self.vars.items():
@@ -899,7 +922,7 @@ def selftest():
     ok = True
     for target in ("pc", "dolphin"):
         e.target = target
-        e.cfg = load_zones("dolphin" if target == "dolphin" else "soh", verbose=False)
+        e.cfg = load_zones(config_target(target), verbose=False)
         print(f"--- {target} (deadzone={e.cfg['deadzone']}, "
               f"ess {e.cfg['ess_output_start']}..{e.cfg['ess_output_end']})")
         for p in (0.05, 0.10, 0.20, 0.35, 0.50, 1.00):

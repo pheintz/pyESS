@@ -57,7 +57,18 @@ jobs:
           $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]
           $cur = "$maj.$min.$pat"
 
-          if ("${{ github.ref_type }}" -eq "tag") {
+          # event_name is tested FIRST, before ref_type. The Run workflow ref dropdown
+          # lists tags as well as branches, so a dispatch aimed at v1.0.1 has
+          # ref_type = tag - and testing ref_type first sent that down the RELEASE path,
+          # overwriting a published release's notes (losing its generated changelog) and
+          # clobbering its asset, from a run this file documents as tagging nothing.
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            # Dry run: build what is here, ship nothing.
+            $ver = $cur
+            "bump=false"    >> $env:GITHUB_OUTPUT
+            "release=false" >> $env:GITHUB_OUTPUT
+          }
+          elseif ("${{ github.ref_type }}" -eq "tag") {
             # Manual path. Fail loudly if the tag and __version__ disagree - otherwise
             # you ship v1.1.0 containing a binary that reports 1.0.0.
             $ver = "${{ github.ref_name }}" -replace '^v', ''
@@ -68,7 +79,7 @@ jobs:
             "bump=false"   >> $env:GITHUB_OUTPUT
             "release=true" >> $env:GITHUB_OUTPUT
           }
-          elseif ("${{ github.event_name }}" -eq "push") {
+          else {
             # Auto path. Start at patch+1 and keep walking until the tag is free, so a
             # re-run - or a __version__ that has drifted behind the tags - still lands
             # on something unused instead of colliding.
@@ -79,19 +90,20 @@ jobs:
             } while (-not [string]::IsNullOrEmpty($taken))
 
             # Rewrite in place via .NET so the existing line endings and encoding
-            # survive untouched - the diff must be this one line and nothing else.
+            # survive untouched. Anchored and counted: the detector reports only the
+            # FIRST match while -replace rewrites every column-0 occurrence, so assert
+            # there is exactly one before touching the file.
+            $hits = ([regex]'(?m)^__version__\s*=\s*"[^"]*"').Matches($raw).Count
+            if ($hits -ne 1) {
+              Write-Error "expected exactly one __version__ line in $src, found $hits"
+              exit 1
+            }
             $new = '__version__ = "' + $ver + '"'
             $raw = $raw -replace '(?m)^__version__\s*=\s*"[^"]*"', $new
             [System.IO.File]::WriteAllText((Resolve-Path $src), $raw)
             Write-Host "bumping $cur -> $ver"
             "bump=true"    >> $env:GITHUB_OUTPUT
             "release=true" >> $env:GITHUB_OUTPUT
-          }
-          else {
-            # workflow_dispatch: build what is here, ship nothing.
-            $ver = $cur
-            "bump=false"    >> $env:GITHUB_OUTPUT
-            "release=false" >> $env:GITHUB_OUTPUT
           }
           "version=$ver" >> $env:GITHUB_OUTPUT
           "zip=pyESS-$ver-win64.zip" >> $env:GITHUB_OUTPUT
@@ -124,9 +136,21 @@ jobs:
         # A hang here used to sit until the job limit; fail in minutes instead.
         timeout-minutes: 10
         run: |
+          # Each command checked. A pwsh step reports only the LAST exit code, so a
+          # failed requirements install used to pass green - and nothing downstream
+          # caught it: selftest imports neither pygame nor vgamepad, and
+          # collect_dynamic_libs returns [] for a missing package instead of raising.
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip self-upgrade failed" }
           pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "requirements install failed" }
           pip install pyinstaller==6.21.0
+          if ($LASTEXITCODE -ne 0) { throw "pyinstaller install failed" }
+          # Prove the native dependency actually imports. Without this nothing in
+          # either workflow ever loads vgamepad, so a missing or moved
+          # ViGEmClient.dll first shows up as a crash on the user's machine.
+          python -c "import vgamepad, pygame; print('deps import OK')"
+          if ($LASTEXITCODE -ne 0) { throw "dependency import check failed" }
 
       # The gate. Needs no controller and no display: it exercises the shaping and
       # the VC inversion and asserts the two targets still agree.
@@ -146,14 +170,34 @@ jobs:
       # missed, the exe reports the old number and this stops the release.
       - name: Smoke-test the built exe
         run: |
-          $want = "${{ steps.ver.outputs.version }}"
-          $got = (./dist/pyESS/pyESS.exe --version) -replace '^pyESS ', ''
-          Write-Host "exe reports $got, expected $want"
-          if ($got -ne $want) {
-            Write-Error "built exe reports $got, not $want"
-            exit 1
+          # packaging/pyESS.spec sets console=False, so this is a GUI-subsystem exe.
+          # Called directly, pwsh captures NOTHING (the result is an empty Object[],
+          # so `-ne` becomes an array filter that is always falsy) and never waits, so
+          # $LASTEXITCODE is never even set. Both assertions here used to be inert:
+          # verified against a deliberately wrong version, the check did not fire.
+          # Start-Process -Wait -PassThru with redirected output is the only form that
+          # yields a real exit code and real stdout from a windowed binary.
+          $exe = "dist/pyESS/pyESS.exe"
+          function RunExe([string[]]$argv, [string]$tag) {
+            $o = "$env:RUNNER_TEMP/$tag.out"; $e = "$env:RUNNER_TEMP/$tag.err"
+            $p = Start-Process -FilePath $exe -ArgumentList $argv -Wait -PassThru `
+                   -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e
+            $text = if (Test-Path $o) { (Get-Content $o -Raw) } else { "" }
+            if (Test-Path $e) { $err = (Get-Content $e -Raw); if ($err) { Write-Host $err } }
+            return [pscustomobject]@{ Code = $p.ExitCode; Out = "$text" }
           }
-          ./dist/pyESS/pyESS.exe --selftest
+
+          $want = "${{ steps.ver.outputs.version }}"
+          $v = RunExe @("--version") "ver"
+          $got = ($v.Out -replace '^pyESS ', '').Trim()
+          Write-Host "exe reports '$got' (exit $($v.Code)), expected '$want'"
+          if ($v.Code -ne 0) { throw "built exe --version exited $($v.Code)" }
+          if ($got -ne $want) { throw "built exe reports '$got', not '$want'" }
+
+          $t = RunExe @("--selftest") "selftest"
+          Write-Host $t.Out
+          if ($t.Code -ne 0) { throw "built exe --selftest exited $($t.Code)" }
+          Write-Host "smoke test passed against the built binary"
 
       - name: Package
         run: Compress-Archive -Path dist/pyESS/* -DestinationPath "${{ steps.ver.outputs.zip }}" -Force
@@ -235,22 +279,45 @@ jobs:
             exit 1
           }
 
+          # Retry every gh call. The tag and bump commit are already pushed by now, so a
+          # transient 5xx here strands a version with no release - and a re-run cannot
+          # repair it: it replays the ORIGINAL trigger SHA, reads the pre-bump
+          # __version__, sees this tag taken, picks the NEXT number, then fails its own
+          # push as non-fast-forward. The orphan is then permanent and manual to fix.
+          # Retrying does not close that window, but it removes its commonest cause.
+          function Gh([string[]]$argv, [string]$what) {
+            for ($i = 1; $i -le 3; $i++) {
+              & gh @argv
+              if ($LASTEXITCODE -eq 0) { return }
+              if ($i -lt 3) {
+                Write-Host "  $what failed (exit $LASTEXITCODE) - retry $i/3"
+                Start-Sleep -Seconds (5 * $i)
+              }
+            }
+            throw "$what failed after 3 attempts - tag $tag is published with no release; " +
+                  "create it by hand rather than re-running, which would pick a new version"
+          }
+
+          $title = "pyESS ${{ steps.ver.outputs.version }}"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "creating release $tag"
-            gh release create $tag `
-              --title "pyESS ${{ steps.ver.outputs.version }}" `
-              --notes-file notes.md `
-              --generate-notes
-            if ($LASTEXITCODE -ne 0) { exit 1 }
+            # --prerelease: the pipeline never publishes a final release. It stays
+            # flagged (and off "Latest") until a human promotes it - see the comment
+            # on the update branch below for why we never re-apply this on a re-run.
+            Gh @("release", "create", $tag, "--title", $title,
+                 "--notes-file", "notes.md", "--generate-notes", "--prerelease") "release create"
           } else {
-            Write-Host "release $tag already exists - updating notes"
-            gh release edit $tag `
-              --title "pyESS ${{ steps.ver.outputs.version }}" `
-              --notes-file notes.md
+            # Deliberately NO --prerelease here. If you have already promoted this
+            # release by hand, a re-run must not silently demote it back.
+            Write-Host "release $tag already exists - updating notes, leaving its"
+            Write-Host "  pre-release flag exactly as you left it"
+            Gh @("release", "edit", $tag, "--title", $title,
+                 "--notes-file", "notes.md") "release edit"
           }
 
           # --clobber so a re-run replaces the asset instead of erroring on a duplicate
-          gh release upload $tag "${{ steps.ver.outputs.zip }}" --clobber
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Gh @("release", "upload", $tag, "${{ steps.ver.outputs.zip }}", "--clobber") "release upload"
           Write-Host "uploaded ${{ steps.ver.outputs.zip }}"
+          Write-Host "$tag is a PRE-RELEASE - promote it when you are ready:"
+          Write-Host "  gh release edit $tag --prerelease=false --latest"

@@ -40,10 +40,15 @@ TARGET_KEYS = ("max_axis_range", "gate_compensation", "input_lag_ms",
 # meaningful. ess_enable is here because the ESS remap is unconditional now.
 RETIRED_SHAPING_KEYS = ("ess_input_start", "ess_input_end", "ess_enable")
 
-# The GUI's output-target radio. This is app-level UI state, not shaping, so it lives at
-# the TOP level of the config - not in "shaping" (the shared curve) or "targets"
-# (per-target tuning). Values are the GUI's own keys; "pc" maps to the "soh" target.
+# The GUI's output-target radio. Values are the GUI's own keys; "pc" maps to the
+# "soh" target on disk - see config_target().
 SELECTED_TARGET_KEY = "selected_target"
+# Per-user UI state lives in its OWN file. It must not go in pyESS_zones.json:
+# that file is tracked and copied verbatim into the release zip, so a radio click
+# by whoever cut the build would become every downloader's default. Keeping it
+# separate also stops a first click creating a one-key pyESS_zones.json that
+# silently masks the "config not found" warning.
+PREFS_FILENAME = "pyESS_prefs.json"
 UI_TARGETS = ("pc", "dolphin")
 DEFAULT_UI_TARGET = "dolphin"
 
@@ -65,6 +70,20 @@ def _base_dir():
 
 def _config_path():
     return os.path.join(_base_dir(), CONFIG_FILENAME)
+
+
+def _prefs_path():
+    return os.path.join(_base_dir(), PREFS_FILENAME)
+
+
+def config_target(ui_target):
+    """Map a GUI radio value ("pc"/"dolphin") to a config target key.
+
+    The two vocabularies differ because the config predates the GUI: "pc" in the
+    radio is the "soh" block on disk. This was written out by hand at five call
+    sites; one helper means adding a target touches one place.
+    """
+    return "dolphin" if ui_target == "dolphin" else "soh"
 
 
 _NUMERIC = ("deadzone", "ess_zone_size", "octagon_cardinal", "octagon_diagonal",
@@ -111,6 +130,10 @@ def _validate(cfg, warn):
         warn("ess_output_start > ess_output_end - swapping")
         cfg["ess_output_start"], cfg["ess_output_end"] = \
             cfg["ess_output_end"], cfg["ess_output_start"]
+    mar = cfg.get("max_axis_range")
+    if mar is not None and not (mar > 0.0):
+        warn(f"max_axis_range {mar} must be > 0 - using 85.0")
+        cfg["max_axis_range"] = 85.0
     card, diag = cfg["octagon_cardinal"], cfg["octagon_diagonal"]
     if not (card / 2.0 < diag < card):
         warn(f"octagon_diagonal {diag} must satisfy {card/2.0} < diag < {card} - "
@@ -132,15 +155,16 @@ def load_zones(target, verbose=True):
     cfg = dict(DEFAULT_SHAPING)
     cfg.update(DEFAULT_TARGETS.get(target, {}))
     source = "built-in defaults"
+    file_shaping = {}          # exactly what the JSON supplied, for the migrations
 
     path = _config_path()
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-            for k, v in (raw.get("shaping") or {}).items():
-                if not k.startswith("_"):
-                    cfg[k] = v
+            file_shaping = {k: v for k, v in (raw.get("shaping") or {}).items()
+                            if not k.startswith("_")}
+            cfg.update(file_shaping)
             tgt = (raw.get("targets") or {}).get(target) or {}
             for k, v in tgt.items():
                 if not k.startswith("_"):
@@ -151,20 +175,35 @@ def load_zones(target, verbose=True):
     else:
         warn(f"{CONFIG_FILENAME} not found; using built-in defaults")
 
-    # Migrate the old two-key form. ess_input_start is gone: only 0 was ever correct.
-    if "ess_zone_size" not in cfg and "ess_input_end" in cfg:
-        cfg["ess_zone_size"] = cfg["ess_input_end"]
+    # Migrations read `file_shaping`, NOT cfg. cfg is seeded from DEFAULT_SHAPING, so
+    # every "is this key absent?" test against it is answered by the default and the
+    # migration never fires - which silently replaced a tuned ess_input_end with the
+    # built-in 0.35 for every pre-migration config.
+    if "ess_zone_size" not in file_shaping and "ess_input_end" in file_shaping:
+        cfg["ess_zone_size"] = file_shaping["ess_input_end"]
+        warn(f"migrated ess_input_end={file_shaping['ess_input_end']} to ess_zone_size")
+    # ess_enable=false was an ESS-remap bypass. ess_zone_size=0 is the exact same
+    # passthrough (verified bit-identical), so carry the intent across rather than
+    # silently switching shaping back on for someone who had turned it off.
+    if file_shaping.get("ess_enable") is False:
+        cfg["ess_zone_size"] = 0.0
+        warn("ess_enable=false is retired; carried over as ess_zone_size=0 "
+             "(same passthrough). Raise ess_zone_size to enable ESS shaping.")
     for _k in RETIRED_SHAPING_KEYS:
         cfg.pop(_k, None)
+
+    cfg["_target"] = target
+    # Coerce FIRST. _coerce exists so a hand-edited value cannot crash startup, but
+    # ess_output_band divides by max_axis_range - running it first meant "85", 0 or
+    # null raised TypeError/ZeroDivisionError before the guard ever ran, killing the
+    # app with no window at all in the windowed build.
+    cfg = _coerce(cfg, warn)
+    cfg = _validate(cfg, warn)
 
     # The output band is fixed by the game; re-derive it so an old or hand-edited
     # value cannot bring back the dead-diagonal corners.
     cfg["ess_output_start"], cfg["ess_output_end"] = ess_output_band(
         cfg.get("max_axis_range", 85.0))
-
-    cfg["_target"] = target
-    cfg = _coerce(cfg, warn)
-    cfg = _validate(cfg, warn)
     cfg["_source"] = source
     cfg["_target"] = target
     return cfg
@@ -172,6 +211,28 @@ def load_zones(target, verbose=True):
 
 SHAPING_KEYS = tuple(k for k in DEFAULT_SHAPING
                      if k not in ("ess_output_start", "ess_output_end"))
+
+
+def _write_json_atomic(path, data):
+    """Write `data` to `path` via a temp file, removing the temp on any failure.
+
+    Without the cleanup, a failed os.replace - the config carrying the Windows read-only
+    attribute is routine after copying a release folder off a share or restoring from
+    backup - left a permanent `.tmp` sitting beside the .exe, one per attempt.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def save_zones(cfg, target=None):
@@ -188,17 +249,27 @@ def save_zones(cfg, target=None):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-        except Exception:
-            raw = {}
+        except Exception as e:
+            # NEVER fall back to {} here. That rewrote the file from defaults and
+            # destroyed _README, the other target's whole block and its _note - on a
+            # config the user was most likely mid-edit. Raise; on_save shows the error.
+            raise ValueError(
+                f"{CONFIG_FILENAME} exists but will not parse ({e}). Fix or delete it "
+                f"first, or saving would overwrite your other settings.") from e
+    if not isinstance(raw, dict):
+        raise ValueError(f"{CONFIG_FILENAME} must contain a JSON object")
 
-    shaping = raw.get("shaping") or {}
-    # Strip retired keys: SHAPING_KEYS no longer names them, so without this they
-    # would survive in the file forever - never overwritten, never removed.
-    for k in RETIRED_SHAPING_KEYS:
-        shaping.pop(k, None)
+    # WHITELIST, not a denylist. Projecting over SHAPING_KEYS makes retiring a key a
+    # one-line deletion from DEFAULT_SHAPING and nothing else; a hand-maintained list of
+    # retired keys is the exact mistake TARGET_KEYS was introduced to stop (see the note
+    # in pyESS_app.on_target). `_`-prefixed entries are comments and pass through.
+    old_shaping = raw.get("shaping") or {}
+    shaping = {k: v for k, v in old_shaping.items() if k.startswith("_")}
     for k in SHAPING_KEYS:
         if k in cfg:
             shaping[k] = cfg[k]
+        elif k in old_shaping:
+            shaping[k] = old_shaping[k]
     raw["shaping"] = shaping
 
     if target:
@@ -210,48 +281,49 @@ def save_zones(cfg, target=None):
         targets[target] = tgt
         raw["targets"] = targets
 
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(raw, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)   # atomic-ish; never leaves a half-written config
-    return path
+    return _write_json_atomic(path, raw)
 
 
-def load_selected_target(verbose=False):
-    """Which output target the GUI had selected last.
+def load_selected_target():
+    """Which output target the GUI had selected last, from the per-user prefs file.
 
     Falls back to DEFAULT_UI_TARGET for a missing, unreadable or unrecognised value: a
-    bad preference must never be the reason the app will not start.
+    bad preference must never be the reason the app will not start. Unrecognised values
+    always warn - the config's own `targets` block is keyed "soh"/"dolphin" while this
+    takes "pc"/"dolphin", so "soh" is the obvious hand-edit and used to revert in
+    silence on every launch.
     """
-    path = _config_path()
+    path = _prefs_path()
     if not os.path.isfile(path):
         return DEFAULT_UI_TARGET
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            val = json.load(fh).get(SELECTED_TARGET_KEY)
+            raw = json.load(fh)
+        val = raw.get(SELECTED_TARGET_KEY) if isinstance(raw, dict) else None
     except Exception:
         return DEFAULT_UI_TARGET
     if val in UI_TARGETS:
         return val
-    if val is not None and verbose:
+    if val is not None:
         print(f"[pyess_config] WARNING: {SELECTED_TARGET_KEY}={val!r} is not one of "
               f"{UI_TARGETS} - using {DEFAULT_UI_TARGET}", file=sys.stderr)
     return DEFAULT_UI_TARGET
 
 
 def save_selected_target(target):
-    """Persist ONLY the radio selection; 'shaping' and 'targets' are left untouched.
+    """Persist the radio selection to the per-user prefs file.
 
-    Deliberately not routed through save_zones. The radio is remembered the moment it
-    is clicked, while tuning values stay behind the Save button - writing the whole
-    config here would silently persist unsaved slider edits along with it.
+    Deliberately NOT in pyESS_zones.json and not routed through save_zones: the radio is
+    remembered the moment it is clicked, while tuning values stay behind the Save button,
+    so sharing a writer would silently persist unsaved slider edits too. Keeping it in a
+    separate file also stops it shipping inside the release zip.
 
-    Returns the path written, or None if the config exists but could not be parsed.
+    Returns the path written, or None if the prefs file exists but could not be parsed.
+    Raises OSError if the write itself fails.
     """
     if target not in UI_TARGETS:
         raise ValueError(f"unknown target {target!r}; expected one of {UI_TARGETS}")
-    path = _config_path()
+    path = _prefs_path()
     raw = {}
     if os.path.isfile(path):
         try:
@@ -259,13 +331,10 @@ def save_selected_target(target):
                 raw = json.load(fh)
         except Exception:
             # Exists but will not parse - most likely a hand-edit in progress. Refuse
-            # to write: clobbering a config to remember a radio button is a bad trade.
+            # to write: clobbering a file to remember a radio button is a bad trade.
             return None
+        if not isinstance(raw, dict):
+            return None          # valid JSON but not an object - same refusal
     raw[SELECTED_TARGET_KEY] = target
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(raw, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)   # same atomic-ish write save_zones uses
-    return path
+    return _write_json_atomic(path, raw)
 
