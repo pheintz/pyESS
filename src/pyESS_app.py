@@ -12,7 +12,7 @@
 #
 # Run:  python pyESS_app.py
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import math
 import os
