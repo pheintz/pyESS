@@ -9,7 +9,7 @@ value is delivered. Edits apply instantly; "Save" persists them.
 GPLv3 - contains code by way of pyess_vc (Skuzee ESS-Adapter port).
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 import math
 import os
