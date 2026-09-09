@@ -2,6 +2,9 @@
 # Pinned to the versions this has actually been tested against.
 pygame==2.6.1
 vgamepad==0.1.0
+# Only for the pop-out input display (skin scaling). The rest of the app runs
+# without it; the display reports a clear error if it is missing.
+Pillow==12.2.0
 
 # Python 3.11+ is required, not just recommended: the 1 kHz input loop paces itself
 # with time.sleep(), which only became high-resolution on Windows in 3.11. On older

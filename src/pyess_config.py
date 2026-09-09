@@ -11,7 +11,8 @@ import sys
 
 from pyess_shaping import ess_output_band
 
-CONFIG_FILENAME = "pyESS_zones.json"
+CONFIG_FILENAME = "pyESS_zones.json"          # shipped defaults; never written to
+USER_CONFIG_FILENAME = "pyESS_zones.local.json"   # your tuning; what Save writes
 
 # Built-in fallback (kept identical to the shipped pyESS_zones.json "shaping" block).
 DEFAULT_SHAPING = {
@@ -61,6 +62,10 @@ def _config_path():
 
 def _prefs_path():
     return os.path.join(_base_dir(), PREFS_FILENAME)
+
+
+def _user_config_path():
+    return os.path.join(_base_dir(), USER_CONFIG_FILENAME)
 
 
 def config_target(ui_target):
@@ -137,23 +142,32 @@ def load_zones(target, verbose=True):
     source = "built-in defaults"
     file_shaping = {}          # exactly what the JSON supplied, for the migrations
 
-    path = _config_path()
-    if os.path.isfile(path):
+    # Two layers: the SHIPPED defaults, then the user's own tuning on top. Save only
+    # ever writes the second, so a developer's personal settings cannot end up as the
+    # default in the release zip - and the shipped baseline stays readable and
+    # restorable by deleting one file.
+    for path, is_user in ((_config_path(), False), (_user_config_path(), True)):
+        if not os.path.isfile(path):
+            if not is_user:
+                warn(f"{CONFIG_FILENAME} not found; using built-in defaults")
+            continue
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-            file_shaping = {k: v for k, v in (raw.get("shaping") or {}).items()
-                            if not k.startswith("_")}
-            cfg.update(file_shaping)
+            if not isinstance(raw, dict):
+                raise ValueError("not a JSON object")
+            layer = {k: v for k, v in (raw.get("shaping") or {}).items()
+                     if not k.startswith("_")}
+            file_shaping.update(layer)
+            cfg.update(layer)
             tgt = (raw.get("targets") or {}).get(target) or {}
             for k, v in tgt.items():
                 if not k.startswith("_"):
                     cfg[k] = v
-            source = CONFIG_FILENAME
+            source = os.path.basename(path) if not is_user else (
+                f"{CONFIG_FILENAME} + {USER_CONFIG_FILENAME}")
         except Exception as e:
-            warn(f"could not read {CONFIG_FILENAME} ({e}); using built-in defaults")
-    else:
-        warn(f"{CONFIG_FILENAME} not found; using built-in defaults")
+            warn(f"could not read {os.path.basename(path)} ({e}); ignoring it")
 
     # Migrations must read file_shaping, not cfg: cfg is seeded from DEFAULT_SHAPING,
     # so any "key absent?" test against it is answered by the default and never fires.
@@ -212,7 +226,7 @@ def save_zones(cfg, target=None):
     Also writes target-specific keys when `target` is given. Raises on failure so
     the GUI can surface it.
     """
-    path = _config_path()
+    path = _user_config_path()
     raw = {}
     if os.path.isfile(path):
         try:
@@ -222,10 +236,10 @@ def save_zones(cfg, target=None):
             # Never fall back to {}: that rewrites the file from defaults and destroys
             # _README and the other target's block on a config being hand-edited.
             raise ValueError(
-                f"{CONFIG_FILENAME} exists but will not parse ({e}). Fix or delete it "
-                f"first, or saving would overwrite your other settings.") from e
+                f"{USER_CONFIG_FILENAME} exists but will not parse ({e}). Fix or delete "
+                f"it first, or saving would overwrite your other settings.") from e
     if not isinstance(raw, dict):
-        raise ValueError(f"{CONFIG_FILENAME} must contain a JSON object")
+        raise ValueError(f"{USER_CONFIG_FILENAME} must contain a JSON object")
 
     # Whitelist, not a denylist: retiring a key is then a one-line deletion from
     # DEFAULT_SHAPING. `_`-prefixed entries are comments and pass through.
@@ -250,21 +264,48 @@ def save_zones(cfg, target=None):
     return _write_json_atomic(path, raw)
 
 
+def load_prefs():
+    """Whole prefs dict, or {} if missing or unreadable."""
+    path = _prefs_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_prefs(**values):
+    """Merge `values` into the prefs file.
+
+    Returns the path, or None if the file exists but will not parse - a hand-edit in
+    progress must not be clobbered to store a UI setting. Raises OSError on write
+    failure. Not routed through save_zones: prefs save on change while tuning values
+    stay behind the Save button, so a shared writer would persist unsaved slider edits.
+    """
+    path = _prefs_path()
+    raw = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception:
+            return None
+        if not isinstance(raw, dict):
+            return None
+    raw.update(values)
+    return _write_json_atomic(path, raw)
+
+
 def load_selected_target():
     """Last selected output target, or DEFAULT_UI_TARGET if missing or unreadable.
 
     Unrecognised values warn: this takes "pc"/"dolphin" while the config's `targets`
     block is keyed "soh"/"dolphin", so "soh" is an easy hand-edit to get wrong.
     """
-    path = _prefs_path()
-    if not os.path.isfile(path):
-        return DEFAULT_UI_TARGET
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-        val = raw.get(SELECTED_TARGET_KEY) if isinstance(raw, dict) else None
-    except Exception:
-        return DEFAULT_UI_TARGET
+    val = load_prefs().get(SELECTED_TARGET_KEY)
     if val in UI_TARGETS:
         return val
     if val is not None:
@@ -274,24 +315,8 @@ def load_selected_target():
 
 
 def save_selected_target(target):
-    """Persist the radio selection; returns the path, or None if prefs will not parse.
-
-    Not routed through save_zones: the radio saves on click while tuning values stay
-    behind the Save button, so a shared writer would persist unsaved slider edits.
-    """
+    """Persist the radio selection; returns the path, or None if prefs will not parse."""
     if target not in UI_TARGETS:
         raise ValueError(f"unknown target {target!r}; expected one of {UI_TARGETS}")
-    path = _prefs_path()
-    raw = {}
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except Exception:
-            # Hand-edit in progress: clobbering it to store a radio button is a bad trade.
-            return None
-        if not isinstance(raw, dict):
-            return None          # valid JSON but not an object - same refusal
-    raw[SELECTED_TARGET_KEY] = target
-    return _write_json_atomic(path, raw)
+    return save_prefs(**{SELECTED_TARGET_KEY: target})
 

@@ -29,14 +29,15 @@ a = Analysis(
     # beside the .exe and the config must sit where _base_dir() looks for it. The
     # build script copies those three to the top level after COLLECT.
     datas=[],
-    hiddenimports=["vgamepad", "pygame"],
+    hiddenimports=["vgamepad", "pygame", "PIL.ImageTk", "pyess_display"],
     hookspath=[],
     runtime_hooks=[],
-    # Trim things a tkinter app never touches. pygame is only used for joystick input.
+    # Trim things a tkinter app never touches. pygame is only used for joystick
+    # input. PIL is NOT excluded: the pop-out input display scales skins with it.
     # Do NOT exclude setuptools: pygame.pkgdata imports pkg_resources at import time,
     # which pulls in jaraco.* - excluding it builds fine and then dies on startup with
     # "No module named 'jaraco'". Found by actually running the build.
-    excludes=["numpy", "scipy", "matplotlib", "PIL", "pytest"],
+    excludes=["numpy", "scipy", "matplotlib", "pytest"],
     noarchive=False,
 )
 

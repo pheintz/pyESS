@@ -23,13 +23,14 @@ from tkinter import ttk, messagebox
 import pyess_shaping as shaping
 import pyess_vc as vc
 from pyess_config import (load_zones, save_zones, TARGET_KEYS, UI_TARGETS,
-                          config_target, load_selected_target,
-                          save_selected_target)
+                          config_target, load_prefs, save_prefs,
+                          load_selected_target, save_selected_target)
 
 HZ = 1000                # poll/emit rate. The loop period is the DOMINANT latency
                          # term: compute is ~5us (SoH) / ~10us (Dolphin), so at 250Hz
                          # we were adding up to 4ms of staleness for ~0.01ms of work.
-TELEMETRY_HZ = 30        # GUI reads at 25Hz; building it every frame was 10x waste
+TELEMETRY_HZ = 60        # display rate. Latched, so this sets how LONG a tap is
+                         # shown, not whether it is caught at all.
 MAX_LAG_S = 0.15         # keep ~150ms of output history (max lag 100ms + margin)
 MAP_PX = 160             # zone-map display size in pixels
 MAP_SAMPLES = 80         # grid actually evaluated (each cell drawn MAP_PX/MAP_SAMPLES px)
@@ -320,10 +321,34 @@ class Engine(threading.Thread):
         naxes = js.get_numaxes()
         dev_name = js.get_name()
 
+        # Trigger axes do not agree on a released value: XInput rests at -1, some pads
+        # rest at 0, and a Santroller rests axis 4 at +0.93 - which the old fixed
+        # (raw+1)/2 turned into a permanently-held LT of 245, sent to the game. Sample
+        # the real rest value instead and treat it as zero. Triggers are released while
+        # a session is opening; "Rescan" re-runs this if one was held.
+        for _ in range(5):                    # let the driver settle before sampling
+            pygame.event.pump()
+            time.sleep(0.01)
+        trig_rest = {k: _axis_safe(js, AXES.get(k), -1.0) for k in ("LT", "RT")}
+
+        def trigger_value(raw, rest):
+            span = 1.0 - rest
+            if span <= 1e-6:                  # pinned at full scale: not a usable axis
+                return 0.0
+            return shaping.clamp((raw - rest) / span, 0.0, 1.0)
+
         period = 1.0 / HZ
         next_t = time.perf_counter()
         tele_period = 1.0 / TELEMETRY_HZ
         next_tele = 0.0
+
+        # Accumulated between telemetry builds so no press is lost to snapshotting.
+        latch_btn, latch_dpad, latch_raw = set(), set(), set()
+        latch_trig = [0, 0]          # peak LT/RT since the last build
+        # Same again for the EMITTED stream. With input_lag_ms these differ, and the
+        # viewer can show either what you pressed or what the game actually got.
+        olatch_btn, olatch_dpad = set(), set()
+        olatch_trig = [0, 0]
 
         delay_buf = deque()          # (timestamp, payload) for artificial input lag
         NEUTRAL = {"ls": (0, 0), "rs": (0, 0), "lt": 0, "rt": 0,
@@ -353,18 +378,24 @@ class Engine(threading.Thread):
             rt_raw = _axis_safe(js, rt_i)
             if lt_i is not None and lt_i == rt_i:      # single combined trigger axis
                 lt_val, rt_val = max(0.0, -lt_raw), max(0.0, lt_raw)
-            else:                                       # separate axes rest at -1
-                lt_val, rt_val = (lt_raw + 1.0) / 2.0, (rt_raw + 1.0) / 2.0
+            else:
+                lt_val = trigger_value(lt_raw, trig_rest["LT"])
+                rt_val = trigger_value(rt_raw, trig_rest["RT"])
             lt_b = int(shaping.clamp(lt_val, 0.0, 1.0) * 255)
             rt_b = int(shaping.clamp(rt_val, 0.0, 1.0) * 255)
 
+            # One get_button call per button, reused for both the mapped output and the
+            # latched raw view, so latching the raw indices costs no extra device reads.
             pressed = {}
             for i in range(nbuttons):
+                try:
+                    down = bool(js.get_button(i))
+                except Exception:
+                    down = False
+                if down:
+                    latch_raw.add(i)
                 if i in button_map:
-                    try:
-                        pressed[i] = bool(js.get_button(i))
-                    except Exception:
-                        pressed[i] = False
+                    pressed[i] = down
             if nhats > 0:
                 try:
                     hx, hy = js.get_hat(0)
@@ -374,6 +405,23 @@ class Engine(threading.Thread):
                 hx = hy = 0
             dpad = (hy > 0, hy < 0, hx < 0, hx > 0)     # up, down, left, right
 
+            # Latch everything the display cares about until the next telemetry build.
+            # Telemetry is a snapshot at TELEMETRY_HZ, so a tap shorter than one period
+            # could fall between snapshots and never be shown - measured at ~50% of
+            # single-frame (16.7ms) inputs. The 1kHz loop already sees every press;
+            # accumulating here means none can be lost on the way to the viewer.
+            # Output is untouched: `emit` above has already been sent.
+            for _i, _d in pressed.items():
+                if _d:
+                    latch_btn.add(_i)
+            for _c, _d in zip("UDLR", dpad):
+                if _d:
+                    latch_dpad.add(_c)
+            if lt_b > latch_trig[0]:
+                latch_trig[0] = lt_b
+            if rt_b > latch_trig[1]:
+                latch_trig[1] = rt_b
+
             # Full output frame for this instant (before any artificial delay).
             payload = {
                 "ls": t["out"],
@@ -382,6 +430,9 @@ class Engine(threading.Thread):
                 "lt": lt_b, "rt": rt_b,
                 "buttons": dict(pressed),
                 "dpad": dpad,
+                # carried so the viewer can show the stick as the GAME sees it,
+                # i.e. after input_lag_ms, not just as it was physically moved
+                "stick": t["stick"], "shaped": t["shaped"], "state": t["state"],
             }
 
             # ---- artificial input lag (SoH only) ----
@@ -407,6 +458,17 @@ class Engine(threading.Thread):
                         emit = pl
                         break
 
+            for _i, _d in emit["buttons"].items():
+                if _d:
+                    olatch_btn.add(_i)
+            for _c, _d in zip("UDLR", emit["dpad"]):
+                if _d:
+                    olatch_dpad.add(_c)
+            if emit["lt"] > olatch_trig[0]:
+                olatch_trig[0] = emit["lt"]
+            if emit["rt"] > olatch_trig[1]:
+                olatch_trig[1] = emit["rt"]
+
             if self.enabled:
                 pad.left_joystick(emit["ls"][0], emit["ls"][1])
                 pad.right_joystick(emit["rs"][0], emit["rs"][1])
@@ -425,14 +487,33 @@ class Engine(threading.Thread):
                 next_tele = now + tele_period
                 t["lag_ms"] = lag_s * 1000.0
                 t["lag_holding"] = lag_s > 0.0 and emit is NEUTRAL
-                t["buttons"] = [BUTTON_NAMES[i] for i, d in pressed.items() if d]
-                t["dpad"] = "".join(c for c, d in zip("UDLR", dpad) if d)
-                t["triggers"] = (lt_b, rt_b)
+                # Report the LATCHED union, not the instant, so brief taps survive.
+                t["buttons"] = [BUTTON_NAMES[i] for i in sorted(latch_btn)
+                                if i in BUTTON_NAMES]
+                t["dpad"] = "".join(c for c in "UDLR" if c in latch_dpad)
+                t["triggers"] = (latch_trig[0], latch_trig[1])
                 t["rstick"] = (rx, ry)
                 # Raw, unmapped device view - used to find real button/axis indices.
+                # Latched too: a tap you are trying to identify is exactly the case
+                # that would otherwise vanish before you could read its index.
                 t["raw_axes"] = [_axis_safe(js, i) for i in range(naxes)]
-                t["raw_buttons"] = [i for i in range(nbuttons) if js.get_button(i)]
+                t["raw_buttons"] = sorted(latch_raw)
                 t["raw_hat"] = (hx, hy)
+                t["out_buttons"] = [BUTTON_NAMES[i] for i in sorted(olatch_btn)
+                                    if i in BUTTON_NAMES]
+                t["out_dpad"] = "".join(c for c in "UDLR" if c in olatch_dpad)
+                t["out_triggers"] = (olatch_trig[0], olatch_trig[1])
+                t["out_stick"] = emit.get("stick", (0.0, 0.0))
+                _ors = emit.get("rs", (0, 0))
+                t["out_rstick"] = (_ors[0] / 32767.0, _ors[1] / 32767.0)
+                t["out_shaped"] = emit.get("shaped", (0.0, 0.0))
+                olatch_btn.clear()
+                olatch_dpad.clear()
+                olatch_trig[0] = olatch_trig[1] = 0
+                latch_btn.clear()
+                latch_dpad.clear()
+                latch_raw.clear()
+                latch_trig[0] = latch_trig[1] = 0
                 t["dev_name"] = dev_name
                 self.telemetry = t
 
@@ -673,6 +754,10 @@ class App:
 
         # Collapsed by default: essential when diagnosing a pad whose buttons do not
         # match the standard layout, pure clutter the rest of the time.
+        self.display = None
+        ttk.Button(root, text="Pop-out input display",
+                   command=self.open_display).pack(anchor="w", padx=8, pady=(0, 4))
+
         self.raw_open = tk.BooleanVar(value=False)
         rf = ttk.Frame(root)
         rf.pack(fill="x", padx=8, pady=(0, 8))
@@ -875,7 +960,47 @@ class App:
             self.lbl_raw_btn.config(
                 text="buttons down: " + (", ".join(str(i) for i in rb) if rb else "-"),
                 foreground="#0a0" if rb else "#888")
-        self.root.after(40, self._tick)
+            if self.display is not None:
+                try:
+                    self.display.update_from(t)
+                except tk.TclError:      # window closed between ticks
+                    self.display = None
+        self.root.after(16, self._tick)      # ~60Hz, matches TELEMETRY_HZ
+
+    def open_display(self):
+        """Open (or re-focus) the pop-out skin display."""
+        if self.display is not None:
+            try:
+                self.display.deiconify()
+                self.display.lift()
+                return
+            except tk.TclError:
+                self.display = None
+        try:
+            from pyess_display import InputDisplay
+        except ImportError as e:
+            messagebox.showerror(
+                "Input display unavailable",
+                "The pop-out display needs Pillow:\n\n    pip install Pillow\n\n"
+                f"{e}")
+            return
+        self.display = InputDisplay(self.root, load_prefs(), self._save_display_pref)
+        self.display.protocol("WM_DELETE_WINDOW", self._close_display)
+
+    def _close_display(self):
+        if self.display is not None:
+            try:
+                self._save_display_pref(display_geometry=self.display.geometry())
+                self.display.destroy()
+            except tk.TclError:
+                pass
+            self.display = None
+
+    def _save_display_pref(self, **values):
+        try:
+            save_prefs(**values)
+        except OSError as e:
+            print(f"[pyESS] could not save display preference: {e}", file=sys.stderr)
 
     def on_close(self):
         if getattr(self, "_dirty", False):
@@ -883,6 +1008,10 @@ class App:
                     "Unsaved changes",
                     "Your zone changes have not been saved.\n\nClose anyway?"):
                 return
+        # Destroying root cascades to child Toplevels WITHOUT firing their
+        # WM_DELETE_WINDOW handler, so close the display explicitly or its size and
+        # position are lost every time the main window is closed.
+        self._close_display()
         self.engine.stop()
         self.root.after(150, self.root.destroy)
 

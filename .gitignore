@@ -7,3 +7,5 @@ dist/
 .vs/
 # per-user UI state (which output target the radio was left on); never shipped
 pyESS_prefs.json
+# your own tuning; the tracked pyESS_zones.json stays the shipped baseline
+pyESS_zones.local.json
