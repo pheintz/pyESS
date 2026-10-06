@@ -180,6 +180,28 @@ class Engine(threading.Thread):
         return math.copysign(ux, sx), math.copysign(uy, sy)
 
     @staticmethod
+    def soh_unprocess(wx, wy, cfg):
+        """Inverse of soh_process: the i16 pair SoH turns into the floats (wx, wy).
+
+        Every step of Process() - sensitivity, dead-zone, clamp, octagon - multiplies
+        both axes by one shared factor, so direction passes straight through and only
+        the length needs inverting. A length past SoH's clamp is left past it - SoH
+        clamps it back - since stopping exactly on it lets i16 truncation land a hair
+        short. The i16 limit scales both axes together so it cannot bend the angle.
+        """
+        mar = cfg.get("max_axis_range", 85.0)
+        dz = cfg.get("soh_deadzone", 0.0)
+        sens = cfg.get("soh_sensitivity", 1.0)
+        lw = math.hypot(wx, wy)
+        if lw == 0.0 or sens <= 0.0:
+            return 0, 0
+        lr = lw / Engine.soh_octagon_ratio(wx, wy)     # length before the octagon
+        ln = dz + lr * (mar - dz) / mar                 # length before the dead-zone
+        k = ln / lw / sens * 32767.0 / mar
+        k = min(k, 32767.0 / max(abs(wx), abs(wy)))
+        return round(wx * k), round(wy * k)    # not int(): 32766.9999 must be 32767
+
+    @staticmethod
     def soh_octagon_ratio(ux, uy):
         """The angle-dependent factor SoH's octagon transform will apply.
         Depends only on direction, so dividing by it beforehand cancels it exactly."""
@@ -207,23 +229,32 @@ class Engine(threading.Thread):
 
         # Cancel SoH's truncate-toward-zero. It ends Process() with
         # `x = copysign(ux, sx)` into an int8_t, so every axis lands up to a full unit
-        # low - a systematic -0.5 bias with no upside. Boost by half an in-game unit so
-        # that truncation behaves like rounding. The i16 -> in-game map is a pure
-        # scaling along the ray, so recover the per-axis factor k from one pass.
-        fx, fy = self.soh_process(ix, iy, cfg)
-        for _ in range(2):                         # one refinement: the boost tilts
-            kx = abs(fx) / abs(ix) if ix else 0.0  # the angle very slightly
-            ky = abs(fy) / abs(iy) if iy else 0.0
-            nx = ix + math.copysign(0.5 / kx, ix) if kx > 1e-9 else ix
-            ny = iy + math.copysign(0.5 / ky, iy) if ky > 1e-9 else iy
-            nx = int(shaping.clamp(nx, -32767, 32767))
-            ny = int(shaping.clamp(ny, -32767, 32767))
-            fx, fy = self.soh_process(nx, ny, cfg)
-        ix, iy = nx, ny
-
-        fx, fy = self.soh_process(ix, iy, cfg)
-        cur = (int(fx), int(fy))                   # int8_t truncation
-        return (ix, iy), cur, None, cur
+        # low - a systematic -0.5 bias with no upside. Make truncation behave like
+        # rounding by aiming each axis at the CENTRE of round(target)'s truncation
+        # window and inverting Process() exactly. The old per-axis +0.5 boost sat on
+        # the window's edge, and boosting the minor axis tilts the angle, shifting
+        # SoH's octagon ratio and dropping the major axis back below it (6 deg:
+        # 61.57 -> 61.99 -> cur 61 while Dolphin delivered 63).
+        tx, ty = self.soh_process(ix, iy, cfg)
+        want = (int(math.copysign(math.floor(abs(tx) + 0.5), tx)),
+                int(math.copysign(math.floor(abs(ty) + 0.5), ty)))
+        # At the rim the centre can be past SoH's reach, and the minor axis's boost
+        # then steals from the major axis. Retry just inside the window's near edge,
+        # which tilts the angle far less, and keep whichever lands closer.
+        best = None
+        for off in (0.5, 0.05):
+            wx = math.copysign(abs(want[0]) + off, tx) if ix else 0.0
+            wy = math.copysign(abs(want[1]) + off, ty) if iy else 0.0
+            out = self.soh_unprocess(wx, wy, cfg)
+            fx, fy = self.soh_process(*out, cfg)
+            cur = (int(fx), int(fy))               # int8_t truncation
+            err = (cur[0] - tx) ** 2 + (cur[1] - ty) ** 2
+            if best is None or err < best[0]:
+                best = (err, out, cur)
+            if cur == want:
+                break
+        _, out, cur = best
+        return out, cur, None, cur
 
     def _out_dolphin(self, ox, oy, cfg):
         """Pre-invert VC so the WAD receives the cur we intended."""
@@ -1179,11 +1210,66 @@ def selftest():
                   f"cur {t['cur'][0]:3d}{gc} -> in-game {t['achieved'][0]:3d} "
                   f"mag {t['mag']:5.1f}  {t['state']}")
     # Both targets must agree on in-game magnitude - that is the whole mirror premise.
-    # Sweep the full ANGLE range, not just cardinal: SoH's octagon transform is skipped
-    # when either axis is zero, so a cardinal-only sweep reports 1.0 while the real
-    # worst case (45 degrees) is 7.1.
     soh_cfg = load_zones("soh", verbose=False)
     dol_cfg = load_zones("dolphin", verbose=False)
+    worst, at = _mirror_worst(e, soh_cfg, dol_cfg)
+    print(f"\nmirror check, config on disk (full angle sweep): worst |pc-dolphin| = "
+          f"{worst:.1f}")
+    if at:
+        print(f"  worst at {at[0]} deg, deflection {at[1]}: "
+              f"SoH mag {at[2]:.1f} vs Dolphin {at[3]:.1f}")
+    if worst > MIRROR_TOLERANCE:
+        print("  FAIL: targets disagree by more than quantisation")
+        ok = False
+
+    # ...and across tunings, not just the one on disk. A rounding bug here once passed
+    # on the shipped config while failing on deadzone 0.05 / ESS 0.30 - and on the
+    # shipped deadzone with ESS off. Only the SHARED shaping varies: the per-target
+    # soh_deadzone / soh_sensitivity model SoH's own options, which pyESS does not
+    # cancel, so they stay as configured.
+    card = soh_cfg["octagon_cardinal"]
+    grid = [(dz, ess, diag) for dz in SELFTEST_DEADZONES for ess in SELFTEST_ESS_SIZES
+            for diag in SELFTEST_DIAGONALS if card / 2.0 < diag < card]
+    failed = []
+    g_worst, g_at = 0.0, None
+    for dz, ess, diag in grid:
+        sc, dc = dict(soh_cfg), dict(dol_cfg)
+        for c in (sc, dc):
+            c.update(deadzone=dz, ess_zone_size=ess, octagon_diagonal=diag)
+        w, a = _mirror_worst(e, sc, dc)
+        if w > g_worst:
+            g_worst, g_at = w, (dz, ess, diag) + a
+        if w > MIRROR_TOLERANCE:
+            failed.append((dz, ess, diag, w, a))
+    print(f"mirror check, {len(grid)} tunings (deadzone x ess_zone_size x "
+          f"octagon_diagonal): worst = {g_worst:.1f}")
+    if g_at:
+        print(f"  worst at deadzone {g_at[0]}, ess {g_at[1]}, diagonal {g_at[2]}, "
+              f"{g_at[3]} deg, deflection {g_at[4]}: "
+              f"SoH mag {g_at[5]:.1f} vs Dolphin {g_at[6]:.1f}")
+    for dz, ess, diag, w, a in failed:
+        print(f"  FAIL deadzone {dz}, ess {ess}, diagonal {diag}: {w:.1f} at {a[0]} deg, "
+              f"deflection {a[1]} (SoH {a[2]:.1f} vs Dolphin {a[3]:.1f})")
+    if failed:
+        ok = False
+    return ok
+
+
+# Mirror tolerance: one unit on each axis, hypot(1, 1) = 1.414. VC cannot reach every
+# in-game value, so Dolphin can land one away from SoH; two is a real disagreement.
+MIRROR_TOLERANCE = 1.501
+SELFTEST_DEADZONES = (0.0, 0.03, 0.05, 0.08, 0.10, 0.15)
+SELFTEST_ESS_SIZES = (0.0, 0.15, 0.25, 0.30, 0.35)
+SELFTEST_DIAGONALS = (0.6, 0.7, 0.8)
+
+
+def _mirror_worst(e, soh_cfg, dol_cfg):
+    """Worst in-game magnitude gap between the two targets over a quadrant sweep.
+
+    Sweeps the full ANGLE range, not just cardinal: SoH's octagon transform is skipped
+    when either axis is zero, so a cardinal-only sweep reports 1.0 while the real
+    worst case (45 degrees) is 7.1.
+    """
     worst, worst_at = 0.0, None
     for deg in range(0, 91, 3):
         th = math.radians(deg)
@@ -1195,17 +1281,7 @@ def selftest():
             d = abs(a - b)
             if d > worst:
                 worst, worst_at = d, (deg, round(p, 2), a, b)
-    print(f"\nmirror check (full angle sweep): worst |pc-dolphin| = {worst:.1f}")
-    if worst_at:
-        print(f"  worst at {worst_at[0]} deg, deflection {worst_at[1]}: "
-              f"SoH mag {worst_at[2]:.1f} vs Dolphin {worst_at[3]:.1f}")
-    if worst > 1.501:
-        print("  WARNING: targets disagree by more than quantisation")
-        if not soh_cfg.get("cancel_soh_octagon", False):
-            print("  HINT: set cancel_soh_octagon=true in the soh target - SoH applies")
-            print("        its own octagon transform (x1.148 at 45 deg) that Dolphin has not.")
-        ok = False
-    return ok
+    return worst, worst_at
 
 
 if __name__ == "__main__":
