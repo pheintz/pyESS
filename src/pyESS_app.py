@@ -86,6 +86,17 @@ def _set_window_icon(root):
         pass
 
 
+def _is_vigem_x360(guid):
+    """Does an SDL joystick GUID carry the wired Xbox 360 identity ViGEm emulates?
+
+    SDL2 GUIDs store vendor and product little-endian at hex [8:12] and [16:20].
+    """
+    try:
+        return guid[8:12] == "5e04" and guid[16:20] == "8e02"
+    except TypeError:
+        return False
+
+
 def _axis_safe(js, idx, default=0.0):
     if idx is None:
         return default
@@ -107,6 +118,16 @@ class Engine(threading.Thread):
         self.target = load_selected_target()
         self.cfg = load_zones(config_target(self.target), verbose=False)
         self.device_index = 0
+        # The pad the user wants, by GUID: indices shift when devices come and go, so
+        # an index alone can reopen the wrong controller after an unplug/replug.
+        self.device_guid = None
+        self.device_guids = []
+        self.device_name = None
+        # The virtual pad lives as long as the engine, NOT one session. VGamepad.__del__
+        # calls vigem_target_remove, so a per-session pad made the game see its
+        # controller vanish and a new one appear on every rescan or replug - often in a
+        # different XInput slot, which games do not rebind to.
+        self._pad = None
         self._stop = threading.Event()
         self._restart = threading.Event()
         self.telemetry = {}
@@ -259,9 +280,50 @@ class Engine(threading.Thread):
                 self.error = str(e)
                 self.status = "error"
                 time.sleep(1.0)
+            finally:
+                # Always release, including the no-controller early return. A second
+                # joystick.init() without a quit() is a no-op, so without this the next
+                # session never re-enumerated and a newly plugged pad was never seen.
+                self._release_joysticks()
             if not self._restart.is_set():
                 time.sleep(0.2)
             self._restart.clear()
+
+    @staticmethod
+    def _release_joysticks():
+        try:
+            import pygame
+            pygame.joystick.quit()
+        except Exception:
+            pass
+
+    def _real_matches(self, guid):
+        """Indices of connected devices with `guid`, minus our own virtual pad.
+
+        The virtual pad is a ViGEm Xbox 360 target, so it enumerates as an input device
+        with the wired-360 identity (VID 045E / PID 028E). If the chosen pad shares that
+        identity, one of the matches is our own output, so it is not counted as the pad
+        coming back. Limitation: with a REAL wired 360 pad AND our virtual pad both
+        connected, the GUIDs are identical and nothing here can tell them apart.
+        """
+        idxs = [i for i, g in enumerate(self.device_guids) if g == guid]
+        if self._pad is not None and _is_vigem_x360(guid):
+            idxs = idxs[:-1]
+        return idxs
+
+    def _enumerate(self, pygame):
+        """Refresh the device names/GUIDs the GUI dropdown is built from."""
+        names, guids = [], []
+        for i in range(pygame.joystick.get_count()):
+            try:
+                j = pygame.joystick.Joystick(i)
+                j.init()
+                names.append(j.get_name())
+                guids.append(j.get_guid())
+            except Exception:
+                names.append(f"device {i}")
+                guids.append(None)
+        self.devices, self.device_guids = names, guids
 
     def _session(self):
         # Suppress pygame's stdout banner: noise in a console build, and with a
@@ -277,31 +339,47 @@ class Engine(threading.Thread):
         except Exception:
             pass
         if pygame.joystick.get_count() == 0:
-            self.status = "no controller"
-            self.error = "No joystick found"
-            time.sleep(1.0)
+            self.devices, self.device_guids = [], []
+            self.status = "waiting for controller"
+            self.error = "No controller connected - plug one in"
+            time.sleep(0.5)       # run() releases joysticks, so the next pass re-scans
             return
 
-        self.devices = []
-        for i in range(pygame.joystick.get_count()):
-            try:
-                j = pygame.joystick.Joystick(i)
-                j.init()
-                self.devices.append(j.get_name())
-            except Exception:
-                self.devices.append(f"device {i}")
-        idx = min(self.device_index, pygame.joystick.get_count() - 1)
+        self._enumerate(pygame)
+        if self.device_guid is None:
+            # First open of this run: our virtual pad does not exist yet, so any index
+            # is a real controller.
+            idx = min(self.device_index, pygame.joystick.get_count() - 1)
+        else:
+            matches = self._real_matches(self.device_guid)
+            if not matches:
+                # The chosen pad is gone. Wait for it - never grab another device. That
+                # could be the other player's pad on a shared station, and once our
+                # virtual pad exists it could be pyESS's OWN output, read back as input.
+                self.status = "waiting for controller"
+                self.error = (f"Waiting for {self.device_name or 'your controller'}"
+                              " - plug it back in")
+                time.sleep(0.5)
+                return
+            idx = matches[0]
+        self.device_index = idx
         js = pygame.joystick.Joystick(idx)
         js.init()
-        try:
-            pad = vg.VX360Gamepad()
-        except Exception as ex:
-            # By far the most common first-run failure. The raw exception says
-            # "Cannot find ViGEm bus driver", which is true but not actionable.
-            raise RuntimeError(
-                f"Could not create the virtual gamepad ({ex}). "
-                "ViGEmBus is required - install it from "
-                "https://github.com/nefarius/ViGEmBus/releases and restart.") from None
+        js_inst = js.get_instance_id()
+        if self.device_guid is None:
+            self.device_guid = js.get_guid()
+        self.device_name = js.get_name()
+        if self._pad is None:
+            try:
+                self._pad = vg.VX360Gamepad()
+            except Exception as ex:
+                # By far the most common first-run failure. The raw exception says
+                # "Cannot find ViGEm bus driver", which is true but not actionable.
+                raise RuntimeError(
+                    f"Could not create the virtual gamepad ({ex}). "
+                    "ViGEmBus is required - install it from "
+                    "https://github.com/nefarius/ViGEmBus/releases and restart.") from None
+        pad = self._pad
         self.status = f"running: {js.get_name()}"
         self.error = None
 
@@ -329,7 +407,13 @@ class Engine(threading.Thread):
         for _ in range(5):                    # let the driver settle before sampling
             pygame.event.pump()
             time.sleep(0.01)
-        trig_rest = {k: _axis_safe(js, AXES.get(k), -1.0) for k in ("LT", "RT")}
+        # A pad with fewer axes than AXES assumes has no trigger axis at all. Reading one
+        # anyway hit _axis_safe's 0.0 default against a calibration default of -1.0,
+        # which pinned LT/RT at 127 - over XInput's press threshold of 30, so the game
+        # saw both triggers held. Several N64-to-USB adapters expose only 2-4 axes.
+        trig_axis = {k: (AXES[k] if AXES.get(k) is not None and AXES[k] < naxes
+                         else None) for k in ("LT", "RT")}
+        trig_rest = {k: _axis_safe(js, i, -1.0) for k, i in trig_axis.items()}
 
         def trigger_value(raw, rest):
             span = 1.0 - rest
@@ -349,14 +433,33 @@ class Engine(threading.Thread):
         # viewer can show either what you pressed or what the game actually got.
         olatch_btn, olatch_dpad = set(), set()
         olatch_trig = [0, 0]
+        # Right stick: keep the furthest excursion since the last build. N64 skins drive
+        # the C-buttons from it, and a snapshot dropped quick C flicks about half the time.
+        latch_rs = [0.0, 0.0, 0.0]   # x, y, squared magnitude
+        olatch_rs = [0, 0, 0]
+        sending = self.enabled       # to notice the moment output is switched off
 
         delay_buf = deque()          # (timestamp, payload) for artificial input lag
         NEUTRAL = {"ls": (0, 0), "rs": (0, 0), "lt": 0, "rt": 0,
                    "buttons": {}, "dpad": (False, False, False, False)}
 
         while not self._stop.is_set() and not self._restart.is_set():
-            for _ in pygame.event.get():
-                pass
+            # Hotplug. These used to be drained unread: an unplugged pad then read as
+            # all-zero through the try/excepts below, the session never ended, and the
+            # replugged pad - which gets a NEW instance id - was never reacquired.
+            lost = False
+            for ev in pygame.event.get():
+                if ev.type == pygame.JOYDEVICEREMOVED:
+                    if getattr(ev, "instance_id", None) == js_inst:
+                        lost = True
+                    else:
+                        self._enumerate(pygame)
+                elif ev.type == pygame.JOYDEVICEADDED:
+                    self._enumerate(pygame)
+            if lost:
+                self.status = "controller disconnected"
+                self.error = "Controller disconnected - plug it back in"
+                break
             cfg = self.cfg               # atomic snapshot
             target = self.target
 
@@ -373,14 +476,22 @@ class Engine(threading.Thread):
             if INVERT.get("RY"):
                 ry = -ry
 
-            lt_i, rt_i = AXES.get("LT"), AXES.get("RT")
+            lt_i, rt_i = trig_axis["LT"], trig_axis["RT"]
             lt_raw = _axis_safe(js, lt_i)
             rt_raw = _axis_safe(js, rt_i)
             if lt_i is not None and lt_i == rt_i:      # single combined trigger axis
                 lt_val, rt_val = max(0.0, -lt_raw), max(0.0, lt_raw)
             else:
-                lt_val = trigger_value(lt_raw, trig_rest["LT"])
-                rt_val = trigger_value(rt_raw, trig_rest["RT"])
+                # Follow the rest point DOWN. A released trigger sits at its minimum, so
+                # a reading below the calibrated rest means calibration caught it held -
+                # likely now that replugs restart sessions automatically. Previously such
+                # a trigger stayed dead for the whole session; now it heals on release.
+                if lt_i is not None and lt_raw < trig_rest["LT"]:
+                    trig_rest["LT"] = lt_raw
+                if rt_i is not None and rt_raw < trig_rest["RT"]:
+                    trig_rest["RT"] = rt_raw
+                lt_val = trigger_value(lt_raw, trig_rest["LT"]) if lt_i is not None else 0.0
+                rt_val = trigger_value(rt_raw, trig_rest["RT"]) if rt_i is not None else 0.0
             lt_b = int(shaping.clamp(lt_val, 0.0, 1.0) * 255)
             rt_b = int(shaping.clamp(rt_val, 0.0, 1.0) * 255)
 
@@ -421,6 +532,9 @@ class Engine(threading.Thread):
                 latch_trig[0] = lt_b
             if rt_b > latch_trig[1]:
                 latch_trig[1] = rt_b
+            _m = rx * rx + ry * ry
+            if _m > latch_rs[2]:
+                latch_rs[0], latch_rs[1], latch_rs[2] = rx, ry, _m
 
             # Full output frame for this instant (before any artificial delay).
             payload = {
@@ -468,18 +582,37 @@ class Engine(threading.Thread):
                 olatch_trig[0] = emit["lt"]
             if emit["rt"] > olatch_trig[1]:
                 olatch_trig[1] = emit["rt"]
+            _ors = emit["rs"]
+            _om = _ors[0] * _ors[0] + _ors[1] * _ors[1]
+            if _om > olatch_rs[2]:
+                olatch_rs[0], olatch_rs[1], olatch_rs[2] = _ors[0], _ors[1], _om
 
-            if self.enabled:
-                pad.left_joystick(emit["ls"][0], emit["ls"][1])
-                pad.right_joystick(emit["rs"][0], emit["rs"][1])
-                pad.left_trigger(emit["lt"])
-                pad.right_trigger(emit["rt"])
-                eb = emit["buttons"]
-                for i, const in button_map.items():
-                    (pad.press_button if eb.get(i) else pad.release_button)(const)
-                for const, down in zip(dpad_consts, emit["dpad"]):
-                    (pad.press_button if down else pad.release_button)(const)
-                pad.update()
+            enabled = self.enabled
+            try:
+                if enabled:
+                    pad.left_joystick(emit["ls"][0], emit["ls"][1])
+                    pad.right_joystick(emit["rs"][0], emit["rs"][1])
+                    pad.left_trigger(emit["lt"])
+                    pad.right_trigger(emit["rt"])
+                    eb = emit["buttons"]
+                    for i, const in button_map.items():
+                        (pad.press_button if eb.get(i) else pad.release_button)(const)
+                    for const, down in zip(dpad_consts, emit["dpad"]):
+                        (pad.press_button if down else pad.release_button)(const)
+                    pad.update()
+                elif sending:
+                    # Output just switched off: go neutral ONCE. Stopping the writes
+                    # alone left the pad holding its last state, so unticking "Send"
+                    # mid-press gave the game a stuck input alongside the raw pad.
+                    pad.reset()
+                    pad.update()
+            except Exception:
+                # The virtual pad outlives sessions, so a dead target (bus driver reset
+                # or reinstalled) would otherwise be reused and fail forever. Drop it so
+                # the next session builds a fresh one.
+                self._pad = None
+                raise
+            sending = enabled
 
             # Telemetry is display-only, so build it at TELEMETRY_HZ rather than HZ.
             # The output above has already been sent; nothing here affects latency.
@@ -492,7 +625,7 @@ class Engine(threading.Thread):
                                 if i in BUTTON_NAMES]
                 t["dpad"] = "".join(c for c in "UDLR" if c in latch_dpad)
                 t["triggers"] = (latch_trig[0], latch_trig[1])
-                t["rstick"] = (rx, ry)
+                t["rstick"] = (latch_rs[0], latch_rs[1])
                 # Raw, unmapped device view - used to find real button/axis indices.
                 # Latched too: a tap you are trying to identify is exactly the case
                 # that would otherwise vanish before you could read its index.
@@ -504,12 +637,13 @@ class Engine(threading.Thread):
                 t["out_dpad"] = "".join(c for c in "UDLR" if c in olatch_dpad)
                 t["out_triggers"] = (olatch_trig[0], olatch_trig[1])
                 t["out_stick"] = emit.get("stick", (0.0, 0.0))
-                _ors = emit.get("rs", (0, 0))
-                t["out_rstick"] = (_ors[0] / 32767.0, _ors[1] / 32767.0)
+                t["out_rstick"] = (olatch_rs[0] / 32767.0, olatch_rs[1] / 32767.0)
                 t["out_shaped"] = emit.get("shaped", (0.0, 0.0))
                 olatch_btn.clear()
                 olatch_dpad.clear()
                 olatch_trig[0] = olatch_trig[1] = 0
+                latch_rs[0] = latch_rs[1] = latch_rs[2] = 0.0
+                olatch_rs[0] = olatch_rs[1] = olatch_rs[2] = 0
                 latch_btn.clear()
                 latch_dpad.clear()
                 latch_raw.clear()
@@ -528,11 +662,12 @@ class Engine(threading.Thread):
                 next_t = time.perf_counter()
 
         try:
-            pad.reset(); pad.update()
+            pad.reset(); pad.update()     # neutral, but the virtual pad stays plugged in
         except Exception:
-            pass
+            self._pad = None              # dead target: rebuild it next session
         pygame.joystick.quit()
-        self.status = "stopped"
+        if self.status.startswith("running"):
+            self.status = "stopped"       # keep "controller disconnected" visible
 
 
 # --------------------------------------------------------------------------
@@ -578,7 +713,7 @@ class App:
         self.dev_combo.pack(side="left", padx=(4, 6))
         self.dev_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_device())
         ttk.Button(row, text="Rescan", width=8,
-                   command=self.refresh_devices).pack(side="left")
+                   command=self.rescan).pack(side="left")
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", pady=(6, 0))
@@ -868,12 +1003,24 @@ class App:
         else:
             self.dev_var.set("(no controller found)")
 
+    def rescan(self):
+        """Re-enumerate devices. This used to only re-read the list the engine took
+        when its session started, so a replugged pad never appeared. The virtual pad
+        survives the restart, so the game keeps its binding."""
+        self.dev_var.set("scanning...")
+        self._known_devices = None        # force the dropdown to resync next tick
+        self.engine.request_restart()
+
     def on_device(self):
         names = list(self.dev_combo["values"])
         try:
-            self.engine.device_index = names.index(self.dev_var.get())
+            idx = names.index(self.dev_var.get())
         except ValueError:
             return
+        self.engine.device_index = idx
+        guids = self.engine.device_guids
+        # Remember the physical pad, not its slot: slots move as devices come and go.
+        self.engine.device_guid = guids[idx] if idx < len(guids) else None
         self.engine.request_restart()
 
     def on_enable(self):

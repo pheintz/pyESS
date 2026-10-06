@@ -16,6 +16,8 @@ Source vocabulary:
     raw:x|y         physical stick, before shaping
 """
 import os
+import re
+import sys
 import tkinter as tk
 import webbrowser
 from tkinter import colorchooser, filedialog, messagebox, ttk
@@ -154,6 +156,45 @@ def resolve(source, telem, stick_mode="shaped", delayed=False):
         vx, vy = telem.get(k(base), (0.0, 0.0))
         return vx if arg == "x" else vy
     return False
+
+
+_GEOMETRY = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
+
+
+def _on_a_monitor(widget, x, y):
+    """Is screen point (x, y) on a monitor that is connected right now?"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.restype = wintypes.HMONITOR
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            # MONITOR_DEFAULTTONULL: no monitor contains the point -> NULL. Asking the
+            # OS handles layouts a bounding box gets wrong: monitors of unequal height,
+            # or one left of the primary at negative coordinates.
+            return bool(user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 0))
+        except Exception:
+            pass
+    return (0 <= x < widget.winfo_vrootwidth()) and (0 <= y < widget.winfo_vrootheight())
+
+
+def safe_geometry(widget, geometry):
+    """Drop a saved window position whose title bar would be on no connected monitor.
+
+    Tk places a window wherever it is told, unclamped - verified: asking for +9000+6000
+    puts it at (9008, 6031). So a position saved on a second monitor reopened invisible,
+    with no way to drag it back, whenever that monitor was absent. The size is kept.
+    """
+    m = _GEOMETRY.match(geometry or "")
+    if not m:
+        return geometry
+    w, h = int(m.group(1)), int(m.group(2))
+    x, y = int(m.group(3).replace("+", "", 1)), int(m.group(4).replace("+", "", 1))
+    # Test the title bar's middle - the part you would grab to move the window.
+    if _on_a_monitor(widget, x + w // 2, y + 10):
+        return geometry
+    return f"{w}x{h}"
 
 
 def build_state(skin, telem, button_map, stick_mode="shaped", delayed=False):
@@ -320,7 +361,7 @@ class InputDisplay(tk.Toplevel):
             self.load_skin(folder, announce=False)
         if prefs.get("display_geometry"):
             try:
-                self.geometry(prefs["display_geometry"])
+                self.geometry(safe_geometry(self, prefs["display_geometry"]))
             except tk.TclError:
                 pass
 
